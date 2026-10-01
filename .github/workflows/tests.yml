@@ -8,6 +8,16 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     services:
+      postgres:
+        image: postgres:18.6-bookworm
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: disposable-test-password
+          POSTGRES_DB: retentiontest
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U test -d retentiontest"
+          --health-interval 5s --health-timeout 5s --health-retries 12
       rabbitmq:
         image: rabbitmq:4.3.6-management
         env:
@@ -29,4 +39,6 @@ jobs:
         env:
           SYNAPSE_PYTHON: .synapse-env/bin/python
           RABBITMQ_TEST_URL: amqp://test:disposable-test-password@localhost:5672/
-      - run: docker build -t retentionbot:test .
+          TEST_DATABASE_URL: postgresql://test:disposable-test-password@localhost:5432/retentiontest
+      - run: docker build -t retentionbot:0.1.0 .
+      - run: bash .github/smoke-compose.sh

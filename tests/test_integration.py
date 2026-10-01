@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import hmac
 import os
+import sqlite3
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -21,9 +22,10 @@ from retentionbot.api import GatewayApi, JsonApi, MatrixApi, segment
 from retentionbot.broker import Broker
 from retentionbot.gateway import AdminGateway
 from retentionbot.service import Service
-from retentionbot.store import Store, now_ms
+from retentionbot.store import now_ms
 from retentionbot.worker import Worker
 
+from .db import open_store, snapshot
 from .test_gateway import start_app
 
 pytestmark = [
@@ -76,7 +78,11 @@ async def homeserver(tmp_path):
         ],
         registration_shared_secret="integration-secret",
         trusted_key_servers=[],
-        retention={"enabled": False},
+        retention={
+            "enabled": True,
+            "default_policy": {"max_lifetime": "7d"},
+            "purge_jobs": [{"interval": 500}],
+        },
         redaction_retention_period=0,
         rc_message={"per_second": 1000, "burst_count": 10000},
         rc_registration={"per_second": 1000, "burst_count": 10000},
@@ -151,9 +157,10 @@ async def test_private_room_commands_redaction_and_physical_media(homeserver, co
         server_name="test.local",
         user_id=bot["user_id"],
         media_grace_seconds=1,
+        retention_config_file=path / "homeserver.yaml",
     )
-    store = Store(path / "retention.db")
-    gateway_store = Store(path / "gateway.db")
+    store = open_store(path / "retention.db")
+    gateway_store = open_store(path / "gateway.db")
     client = AsyncClient(
         base,
         bot["user_id"],
@@ -191,21 +198,25 @@ async def test_private_room_commands_redaction_and_physical_media(homeserver, co
             await member_api.request(
                 "PUT",
                 prefix + "/send/m.room.message/denied",
-                json={"msgtype": "m.text", "body": "!retention off"},
+                json={"msgtype": "m.text", "body": '{"command":"retention","action":"off"}'},
             )
             await service.sync_once()
-            assert store.room(room)["lifetime"] == config.default_lifetime
+            assert store.room(room)["lifetime"] == 604_800_000
             await human_api.request(
                 "PUT",
                 prefix + "/send/m.room.message/setting",
-                json={"msgtype": "m.text", "body": "!retention set 1h"},
+                json={
+                    "msgtype": "m.text",
+                    "body": '{"command":"retention","action":"set","max_lifetime":"1h"}',
+                },
             )
             await service.sync_once()
             assert store.room(room)["lifetime"] == 3_600_000
             missed = []
             for i in range(125):
                 sent = await human_api.request(
-                    "PUT", prefix + f"/send/m.room.message/gap-{i}",
+                    "PUT",
+                    prefix + f"/send/m.room.message/gap-{i}",
                     json={"msgtype": "m.text", "body": f"gap test {i}"},
                 )
                 missed.append(sent["event_id"])
@@ -232,7 +243,9 @@ async def test_private_room_commands_redaction_and_physical_media(homeserver, co
             await service.sync_once()
             # Test clock: change the per-room lifetime without waiting an hour.
             with store.db:
-                store.db.execute("UPDATE rooms SET lifetime=1 WHERE room_id=?", (room,))
+                store.db.execute(
+                    "UPDATE events SET ts=0,anchor_ts=0 WHERE event_id=?", (sent["event_id"],)
+                )
             await asyncio.sleep(0.01)
             worker = Worker(config, store, bot_api, gateway)
             await worker.handle("redact", sent["event_id"])
@@ -261,9 +274,15 @@ async def test_e2ee_commands_and_attachment_metadata(homeserver, config):
     base, path = homeserver
     human = await register(base, "human", admin=True)
     bot = await register(base, "retention")
-    config = replace(config, homeserver=base, server_name="test.local", user_id=bot["user_id"])
-    store = Store(path / "retention.db")
-    gateway_store = Store(path / "gateway.db")
+    config = replace(
+        config,
+        homeserver=base,
+        server_name="test.local",
+        user_id=bot["user_id"],
+        retention_config_file=path / "homeserver.yaml",
+    )
+    store = open_store(path / "retention.db")
+    gateway_store = open_store(path / "gateway.db")
     clients = []
     for identity in [human, bot]:
         crypto = path / identity["user_id"].split(":")[0].removeprefix("@")
@@ -317,7 +336,12 @@ async def test_e2ee_commands_and_attachment_metadata(homeserver, config):
             for device in sender.device_store.active_user_devices(bot["user_id"]):
                 sender.verify_device(device)
             sent = await sender.room_send(
-                room, "m.room.message", {"msgtype": "m.text", "body": "!retention set 1d"}
+                room,
+                "m.room.message",
+                {
+                    "msgtype": "m.text",
+                    "body": '{"command":"retention","action":"set","max_lifetime":"1d"}',
+                },
             )
             assert not isinstance(sent, ErrorResponse)
             await service.sync_once()
@@ -351,7 +375,7 @@ async def test_e2ee_commands_and_attachment_metadata(homeserver, config):
             assert store.db.execute(
                 "SELECT uri FROM media WHERE uri=?", ("mxc://test.local/encryptedFile",)
             ).fetchone()
-            assert "encrypted.bin" not in "\n".join(store.db.iterdump())
+            assert "encrypted.bin" not in snapshot(store)
         finally:
             for client in clients:
                 await client.close()
@@ -375,3 +399,107 @@ async def test_real_rabbitmq_redelivery_and_persistent_job():
         await second.ack()
     finally:
         await broker.close()
+
+
+@pytest.mark.parametrize("timing", ["before", "after"])
+async def test_native_purge_and_client_notification(homeserver, config, timing):
+    base, path = homeserver
+    human = await register(base, "human", admin=True)
+    bot = await register(base, "retention")
+    config = replace(
+        config,
+        homeserver=base,
+        server_name="test.local",
+        user_id=bot["user_id"],
+        retention_config_file=path / "homeserver.yaml",
+        redaction_lead_ms=1500 if timing == "before" else 0,
+    )
+    store, gateway_store = open_store(path / "retention.db"), open_store(path / "gateway.db")
+    client = AsyncClient(
+        base,
+        bot["user_id"],
+        store_path=str(path),
+        config=AsyncClientConfig(encryption_enabled=True, pickle_key="test-key"),
+    )
+    client.restore_login(bot["user_id"], bot["device_id"], bot["access_token"])
+    async with aiohttp.ClientSession() as session:
+        admin = MatrixApi(base, human["access_token"], session)
+        runner, gateway_url = await start_app(AdminGateway(config, admin, gateway_store).app())
+        gateway, bot_api = (
+            GatewayApi(gateway_url, config.gateway_secret, session),
+            MatrixApi(base, bot["access_token"], session),
+        )
+        service = Service(config, store, client, bot_api, gateway, AsyncMock())
+        try:
+            room = (
+                await admin.request(
+                    "POST", "/_matrix/client/v3/createRoom", json={"preset": "private_chat"}
+                )
+            )["room_id"]
+            await service.discover()
+            await service.sync_once()
+            await admin.set_retention(room, {"min_lifetime": 100, "max_lifetime": 2000})
+            target = (
+                await admin.request(
+                    "PUT",
+                    f"/_matrix/client/v3/rooms/{segment(room)}/send/m.room.message/target",
+                    json={"msgtype": "m.text", "body": "expires natively"},
+                )
+            )["event_id"]
+            await service.sync_once()
+            assert store.db.execute("SELECT 1 FROM events WHERE event_id=?", (target,)).fetchone()
+            for i in range(2):
+                await admin.request(
+                    "PUT",
+                    f"/_matrix/client/v3/rooms/{segment(room)}/send/m.room.message/anchor{i}",
+                    json={"msgtype": "m.text", "body": "anchor"},
+                )
+            with sqlite3.connect(path / "synapse.db") as server_db:
+                if timing == "before":
+                    event = store.db.execute(
+                        "SELECT ts FROM events WHERE event_id=?", (target,)
+                    ).fetchone()
+                    delay = max(0, event["ts"] + 510 - now_ms()) / 1000
+                    await asyncio.sleep(delay)
+                    assert server_db.execute(
+                        "SELECT 1 FROM event_json WHERE event_id=?", (target,)
+                    ).fetchone()
+                    await Worker(config, store, bot_api, gateway).handle("redact", target)
+                    assert (
+                        store.db.execute(
+                            "SELECT redacted FROM events WHERE event_id=?", (target,)
+                        ).fetchone()[0]
+                        == 1
+                    )
+                    sync = await bot_api.request(
+                        "GET",
+                        "/_matrix/client/v3/sync",
+                        params={"since": store.get("sync_token"), "timeout": "100"},
+                    )
+                    timeline = sync["rooms"]["join"][room]["timeline"]["events"]
+                    assert any(
+                        e["type"] == "m.room.redaction"
+                        and e.get("redacts", e["content"].get("redacts")) == target
+                        for e in timeline
+                    )
+                # Actual native purge remains enabled after the bot's work.
+                for _ in range(100):
+                    if not server_db.execute(
+                        "SELECT 1 FROM event_json WHERE event_id=?", (target,)
+                    ).fetchone():
+                        break
+                    await asyncio.sleep(0.1)
+                else:
+                    pytest.fail("Native retention did not purge the target")
+                if timing == "after":
+                    await Worker(config, store, bot_api, gateway).handle("redact", target)
+                    row = store.db.execute(
+                        "SELECT * FROM events WHERE event_id=?", (target,)
+                    ).fetchone()
+                    assert row["redacted"] == 0
+                    assert row["error"] == "REDACTION_NOT_VISIBLE"
+        finally:
+            await client.close()
+            await runner.cleanup()
+            store.close()
+            gateway_store.close()

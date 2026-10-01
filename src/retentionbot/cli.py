@@ -13,6 +13,7 @@ from nio import AsyncClient, AsyncClientConfig, ErrorResponse
 
 from . import gateway, service, worker
 from .config import Config, base_url
+from .jsonlog import JsonFormatter
 from .store import Store, now_ms
 
 
@@ -37,7 +38,12 @@ async def login(args):
             descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(descriptor, "w") as output:
                 output.write(value + "\n")
-        print("Сохранены bot_access_token и bot_device_id. Токен в вывод не выводится.")
+        print(
+            json.dumps(
+                {"ok": True, "message": "Сохранены bot_access_token и bot_device_id."},
+                ensure_ascii=False,
+            )
+        )
     finally:
         await client.close()
 
@@ -68,6 +74,8 @@ def main():
         level=os.getenv("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    for handler in logging.getLogger().handlers:
+        handler.setFormatter(JsonFormatter())
     # Matrix-nio debug logging may contain events. AMQP logs may contain connection URLs.
     for name in ("nio", "aio_pika", "aiormq"):
         logging.getLogger(name).setLevel(logging.CRITICAL)
@@ -80,19 +88,18 @@ def main():
         logging.error("Configuration failed: %s; check .env and secret files", type(error).__name__)
         raise SystemExit(1) from None
     if args.command in {"status", "health"}:
-        store = Store(config.data_dir / "retention.db")
+        store = Store(config.database_url or config.data_dir / "retention.db")
         try:
+            if args.command == "health":
+                last_sync = int(store.get("last_sync_at") or "0")
+                raise SystemExit(0 if now_ms() - last_sync < 90_000 else 1)
             counts = store.counts()
             counts.update(
                 coverage_ok=store.get("coverage_ok") == "1",
                 last_sync_at=store.get("last_sync_at"),
                 rooms=[dict(row) for row in store.db.execute("SELECT * FROM rooms")],
             )
-            if args.command == "status":
-                print(json.dumps(counts, ensure_ascii=False, indent=2))
-            else:
-                last_sync = int(store.get("last_sync_at") or "0")
-                raise SystemExit(0 if now_ms() - last_sync < 90_000 else 1)
+            print(json.dumps(counts, ensure_ascii=False))
         finally:
             store.close()
         return

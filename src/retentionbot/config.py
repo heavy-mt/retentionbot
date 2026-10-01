@@ -39,12 +39,15 @@ class Config:
     user_id: str
     gateway_url: str
     gateway_secret: str
+    retention_config_file: Path | None = None
+    database_url: str = ""
     rabbitmq_url: str = "amqp://guest:guest@localhost/"
     data_dir: Path = Path("data")
     default_period: str = "7d"
-    poll_seconds: int = 5
+    poll_seconds: int = 1
     discover_seconds: int = 60
     admin_power_level: int = 100
+    redaction_lead_ms: int = 300_000
     media_grace_seconds: int = 60
     trust_devices: str = "tofu"
 
@@ -71,11 +74,16 @@ class Config:
             gateway_url=base_url(os.getenv("GATEWAY_URL", "http://admin-gateway:8080")),
             gateway_secret=secret("GATEWAY_SECRET"),
             rabbitmq_url=secret("RABBITMQ_URL"),
+            retention_config_file=Path(os.environ["SYNAPSE_RETENTION_CONFIG_FILE"])
+            if os.getenv("SYNAPSE_RETENTION_CONFIG_FILE")
+            else None,
+            database_url=secret("DATABASE_URL", required=False),
             data_dir=Path(os.getenv("DATA_DIR", "/data")),
             default_period=period,
-            poll_seconds=positive("POLL_SECONDS", 5),
+            poll_seconds=positive("POLL_SECONDS", 1),
             discover_seconds=positive("DISCOVER_SECONDS", 60),
             admin_power_level=positive("ROOM_ADMIN_POWER_LEVEL", 100),
+            redaction_lead_ms=positive("REDACTION_LEAD_SECONDS", 300) * 1000,
             media_grace_seconds=positive("MEDIA_GRACE_SECONDS", 60),
             trust_devices=trust,
         )

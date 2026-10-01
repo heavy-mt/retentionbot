@@ -56,6 +56,23 @@ class MatrixApi(JsonApi):
             f"/_matrix/client/v3/rooms/{segment(room_id)}/state/m.room.member/{segment(user_id)}",
         )
 
+    async def retention(self, room_id: str) -> dict:
+        try:
+            return await self.request(
+                "GET", f"/_matrix/client/v3/rooms/{segment(room_id)}/state/m.room.retention"
+            )
+        except ApiError as error:
+            if error.status == 404 and error.code == "M_NOT_FOUND":
+                return {}
+            raise
+
+    async def set_retention(self, room_id: str, content: dict):
+        return await self.request(
+            "PUT",
+            f"/_matrix/client/v3/rooms/{segment(room_id)}/state/m.room.retention",
+            json=content,
+        )
+
     async def redact(self, room_id: str, event_id: str, transaction: str):
         result = await self.request(
             "PUT",
@@ -64,10 +81,26 @@ class MatrixApi(JsonApi):
         )
         if not isinstance(result.get("event_id"), str) or not result["event_id"]:
             raise ApiError(502, "REDACTION_UNCONFIRMED")
+        # Synapse can accept a redaction after purge while withholding it from clients.
+        # Confirm that the newly created redaction is actually available to a room member.
+        try:
+            visible = await self.request(
+                "GET",
+                f"/_matrix/client/v3/rooms/{segment(room_id)}/event/{segment(result['event_id'])}",
+            )
+        except ApiError as error:
+            if error.status == 404:
+                raise ApiError(502, "REDACTION_NOT_VISIBLE") from None
+            raise
+        if visible.get("type") != "m.room.redaction":
+            raise ApiError(502, "REDACTION_NOT_VISIBLE")
         return result
 
 
 class GatewayApi(JsonApi):
+    async def retention_config(self) -> dict:
+        return await self.request("GET", "/v1/retention-config")
+
     async def rooms(self) -> list[dict]:
         return (await self.request("GET", "/v1/rooms"))["rooms"]
 

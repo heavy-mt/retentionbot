@@ -15,21 +15,24 @@ x-bot: &bot
     GATEWAY_SECRET_FILE: /run/secrets/gateway_secret
     CRYPTO_STORE_KEY_FILE: /run/secrets/crypto_store_key
     GATEWAY_URL: http://admin-gateway:8080
-    RABBITMQ_URL: amqp://retention:${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD}@rabbitmq:5672/
-    DEFAULT_RETENTION: ${DEFAULT_RETENTION:-7d}
+    DATABASE_URL: postgresql://retention:${DATABASE_PASSWORD:?Set DATABASE_PASSWORD}@postgres:5432/retentionbot
+    RABBITMQ_URL: amqp://retention:${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD}@rabbitmq:5672/retention
     DEVICE_TRUST: ${DEVICE_TRUST:-tofu}
-    POLL_SECONDS: ${POLL_SECONDS:-5}
+    POLL_SECONDS: ${POLL_SECONDS:-1}
     DISCOVER_SECONDS: ${DISCOVER_SECONDS:-60}
+    REDACTION_LEAD_SECONDS: ${REDACTION_LEAD_SECONDS:-300}
     MEDIA_GRACE_SECONDS: ${MEDIA_GRACE_SECONDS:-60}
     ROOM_ADMIN_POWER_LEVEL: ${ROOM_ADMIN_POWER_LEVEL:-100}
-    NATIVE_RETENTION_DISABLED: ${NATIVE_RETENTION_DISABLED:-false}
   volumes: [bot-data:/data]
   secrets: [bot_access_token, bot_device_id, gateway_secret, crypto_store_key]
+  networks: [outbound, broker, state]
   depends_on:
+    postgres:
+      condition: service_healthy
     rabbitmq:
       condition: service_healthy
     admin-gateway:
-      condition: service_started
+      condition: service_healthy
 
 services:
   observer:
@@ -41,11 +44,10 @@ services:
       timeout: 10s
       start_period: 120s
       retries: 3
-
   worker:
     <<: *bot
     command: [worker]
-
+    secrets: [bot_access_token, gateway_secret]
   admin-gateway:
     build: .
     image: retentionbot:0.1.0
@@ -61,23 +63,54 @@ services:
       BOT_USER_ID: ${BOT_USER_ID}
       GATEWAY_SECRET_FILE: /run/secrets/gateway_secret
       SYNAPSE_ADMIN_TOKEN_FILE: /run/secrets/synapse_admin_token
+      SYNAPSE_RETENTION_CONFIG_FILE: /etc/retentionbot/synapse.yaml
+      DATABASE_URL: postgresql://retention:${DATABASE_PASSWORD}@postgres:5432/retentionbot
       RABBITMQ_URL: amqp://unused
-    volumes: [gateway-data:/data]
+    volumes:
+      - ${SYNAPSE_RETENTION_CONFIG_PATH:?Set SYNAPSE_RETENTION_CONFIG_PATH}:/etc/retentionbot/synapse.yaml:ro
     secrets: [gateway_secret, synapse_admin_token]
-    # Admin gateway and AMQP ports are intentionally available only inside Compose.
-
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
+    networks: [outbound, state]
+    depends_on:
+      postgres:
+        condition: service_healthy
   rabbitmq:
-    image: rabbitmq:4.3.6-management
+    image: rabbitmq:4.3.6
     hostname: rabbitmq
     restart: unless-stopped
     environment:
       RABBITMQ_DEFAULT_USER: retention
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+      RABBITMQ_DEFAULT_VHOST: retention
     volumes: [rabbitmq-data:/var/lib/rabbitmq]
+    networks: [broker]
     healthcheck:
       test: [CMD, rabbitmq-diagnostics, -q, ping]
       interval: 15s
       timeout: 10s
+      retries: 10
+  postgres:
+    image: postgres:18.6-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: retentionbot
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_admin_password
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD}
+    secrets: [postgres_admin_password]
+    volumes:
+      - postgres-data:/var/lib/postgresql
+      - ./deploy/postgres-init.sh:/docker-entrypoint-initdb.d/10-retentionbot.sh:ro
+    networks: [state]
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -h 127.0.0.1 -U postgres -d retentionbot]
+      interval: 10s
+      timeout: 5s
       retries: 10
 
 secrets:
@@ -91,8 +124,16 @@ secrets:
     file: ./secrets/crypto_store_key
   synapse_admin_token:
     file: ./secrets/synapse_admin_token
+  postgres_admin_password:
+    file: ./secrets/postgres_admin_password
 
 volumes:
   bot-data:
-  gateway-data:
   rabbitmq-data:
+  postgres-data:
+networks:
+  outbound:
+  broker:
+    internal: true
+  state:
+    internal: true

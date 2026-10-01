@@ -1,23 +1,36 @@
 from retentionbot.media import attachment_uris, split_mxc
 from retentionbot.service import parse_command
-from retentionbot.store import Store
+
+from .db import open_store
 
 
 def test_no_retroactive_processing_and_restart(tmp_path):
     path = tmp_path / "state.db"
-    db = Store(path)
+    db = open_store(path)
     db.enroll("!r:example.org", 1000, since_ts=2000)
     assert not db.record("!r:example.org", "$old", 1999, kind="m.room.message")
     assert db.record("!r:example.org", "$new", 2000, kind="m.room.message")
     db.set("sync_token", "checkpoint")
     db.close()
-    db = Store(path)
+    db = open_store(path)
     db.enroll("!r:example.org", 5000, since_ts=9000)
     assert db.room("!r:example.org")["since_ts"] == 2000
     assert db.room("!r:example.org")["lifetime"] == 1000
     assert db.get("sync_token") == "checkpoint"
     assert [e["event_id"] for e in db.due_events(400_000)] == ["$new"]
     db.close()
+
+
+def test_failed_first_enrollment_starts_only_after_success(store):
+    room = "!pending:example.org"
+    store.enroll(room, 1000, since_ts=100, active=False)
+    assert not store.record(room, "$during-failure", 200, kind="m.room.message")
+    store.enroll(room, 1000, since_ts=300)
+    assert not store.record(room, "$before-join", 299, kind="m.room.message")
+    assert store.record(room, "$after-join", 300, kind="m.room.message")
+    store.enroll(room, 5000, since_ts=1000)
+    assert store.room(room)["since_ts"] == 300
+    assert store.room(room)["lifetime"] == 1000
 
 
 def test_edit_expires_with_original(store):
@@ -106,7 +119,13 @@ def test_mxc_path_traversal_and_remote_urls_rejected():
 
 
 def test_command_parsing_is_exact():
-    assert parse_command("!retention set 7d") == ("set", "7d")
-    assert parse_command("!retention set 2d") == ("invalid", None)
+    import json
+
+    command = {"command": "retention", "action": "set", "min_lifetime": "1h", "max_lifetime": "7d"}
+    action, argument = parse_command(json.dumps(command))
+    assert action == "set"
+    assert json.loads(argument) == {"min_lifetime": "1h", "max_lifetime": "7d"}
+    assert parse_command('{"command":"retention","action":"set"}') == ("invalid", None)
     assert parse_command("hello !retention off") is None
-    assert parse_command("!retention off extra") == ("invalid", None)
+    assert parse_command('{"command":"other"}') is None
+    assert parse_command('{"command":"retention","action":"off","extra":true}') == ("invalid", None)

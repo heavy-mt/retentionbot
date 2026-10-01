@@ -18,8 +18,7 @@ async def test_disabled_policy_cancels_already_queued_job(config, store):
 async def test_increased_period_postpones_queued_job(config, store):
     at = now_ms()
     store.record("!room:example.org", "$a", at - 2000, kind="m.room.message")
-    with store.db:
-        store.db.execute("UPDATE rooms SET lifetime=5000")
+    store.policy("!room:example.org", None, 5000)
     matrix = AsyncMock()
     await Worker(config, store, matrix, AsyncMock()).handle("redact", "$a")
     matrix.redact.assert_not_called()

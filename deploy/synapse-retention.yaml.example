@@ -1,11 +1,15 @@
-# Merge into the existing Synapse configuration and restart Synapse.
-# Retentionbot is responsible for expiry. Native purge must not outrun its observer.
+# Keep native retention enabled. This must be a config file actually loaded by Synapse,
+# not an independent copy of its settings. Mount the same file read-only into the gateway.
+# Room policies and existing settings are preserved; values below are examples.
 retention:
-  enabled: false
+  enabled: true
+  default_policy:
+    min_lifetime: 1h
+    max_lifetime: 7d
+  allowed_lifetime_min: 1h
+  allowed_lifetime_max: 30d
+  purge_jobs:
+    - interval: 1h
 
-# Synapse removes original redacted content on its cleanup pass (approximately every 5 min).
-# This preserves protocol event envelopes and redaction events for reconnecting clients.
+# Optional: promptly scrub the contents of redacted events in the background.
 redaction_retention_period: 0
-
-# If configured on your Synapse version, redaction_allowed_period must allow the longest TTL.
-# redaction_allowed_period: null

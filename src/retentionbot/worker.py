@@ -6,10 +6,12 @@ import json
 import logging
 
 import aiohttp
+import psycopg
 
 from .api import ApiError, GatewayApi, MatrixApi
 from .broker import Broker
 from .config import Config, secret
+from .policy import ServerPolicy
 from .store import Store, now_ms
 
 log = logging.getLogger(__name__)
@@ -26,6 +28,28 @@ class Worker:
     async def handle(self, kind: str, key: str):
         at = now_ms()
         if kind == "redact":
+            known = self.store.db.execute(
+                "SELECT room_id,redacted FROM events WHERE event_id=?", (key,)
+            ).fetchone()
+            if known and known["redacted"]:
+                self.store.release(kind, key)
+                return
+            settings = self.store.get("server_retention")
+            if known and settings:
+                # Re-read room state before acting on a possibly stale broker job.
+                try:
+                    policy = ServerPolicy(**json.loads(settings)).effective(
+                        await self.matrix.retention(known["room_id"])
+                    )
+                    self.store.policy(
+                        known["room_id"],
+                        policy.min_lifetime,
+                        policy.max_lifetime,
+                        lead_ms=self.config.redaction_lead_ms,
+                    )
+                except (ApiError, aiohttp.ClientError, TimeoutError, ValueError):
+                    self.store.retry(key, at + 60_000, "POLICY_REFRESH_FAILED")
+                    return
             event = self.store.event_due(key, at)
             if not event:
                 self.store.release(kind, key)
@@ -45,7 +69,10 @@ class Worker:
                 )
                 return
             self.store.mark_redacted(key, now_ms() + self.config.media_grace_seconds * 1000)
-            log.info("Redacted room=%s event=%s", event["room_id"], key)
+            log.info(
+                "Содержимое сообщения удалено",
+                extra={"event": "message.redacted", "room_id": event["room_id"], "event_id": key},
+            )
         elif kind == "media":
             if not self.store.cleanup_ready(at) or not self.store.media_eligible(key, at):
                 self.store.release(kind, key)
@@ -66,7 +93,7 @@ class Worker:
 
 
 async def run(config: Config):
-    store = Store(config.data_dir / "retention.db")
+    store = Store(config.database_url or config.data_dir / "retention.db")
     broker = await Broker().connect(config.rabbitmq_url)
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
         worker = Worker(
@@ -87,6 +114,10 @@ async def run(config: Config):
                     except (ValueError, KeyError, TypeError, json.JSONDecodeError):
                         await message.reject(requeue=False)
                         log.error("Rejected malformed job")
+                    except (psycopg.OperationalError, psycopg.InterfaceError):
+                        await message.nack(requeue=True)
+                        log.error("Database connection failed; restarting worker")
+                        raise
                     except asyncio.CancelledError:
                         raise
                     except Exception:

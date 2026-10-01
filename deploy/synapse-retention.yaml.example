@@ -1,0 +1,11 @@
+# Merge into the existing Synapse configuration and restart Synapse.
+# Retentionbot is responsible for expiry. Native purge must not outrun its observer.
+retention:
+  enabled: false
+
+# Synapse removes original redacted content on its cleanup pass (approximately every 5 min).
+# This preserves protocol event envelopes and redaction events for reconnecting clients.
+redaction_retention_period: 0
+
+# If configured on your Synapse version, redaction_allowed_period must allow the longest TTL.
+# redaction_allowed_period: null

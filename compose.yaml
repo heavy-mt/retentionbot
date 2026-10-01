@@ -1,0 +1,98 @@
+x-bot: &bot
+  build: .
+  image: retentionbot:0.1.0
+  restart: unless-stopped
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  environment: &bot-env
+    MATRIX_HOMESERVER: ${MATRIX_HOMESERVER:?Set MATRIX_HOMESERVER}
+    MATRIX_SERVER_NAME: ${MATRIX_SERVER_NAME:?Set MATRIX_SERVER_NAME}
+    BOT_USER_ID: ${BOT_USER_ID:?Set BOT_USER_ID}
+    BOT_ACCESS_TOKEN_FILE: /run/secrets/bot_access_token
+    BOT_DEVICE_ID_FILE: /run/secrets/bot_device_id
+    GATEWAY_SECRET_FILE: /run/secrets/gateway_secret
+    CRYPTO_STORE_KEY_FILE: /run/secrets/crypto_store_key
+    GATEWAY_URL: http://admin-gateway:8080
+    RABBITMQ_URL: amqp://retention:${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD}@rabbitmq:5672/
+    DEFAULT_RETENTION: ${DEFAULT_RETENTION:-7d}
+    DEVICE_TRUST: ${DEVICE_TRUST:-tofu}
+    POLL_SECONDS: ${POLL_SECONDS:-5}
+    DISCOVER_SECONDS: ${DISCOVER_SECONDS:-60}
+    MEDIA_GRACE_SECONDS: ${MEDIA_GRACE_SECONDS:-60}
+    ROOM_ADMIN_POWER_LEVEL: ${ROOM_ADMIN_POWER_LEVEL:-100}
+    NATIVE_RETENTION_DISABLED: ${NATIVE_RETENTION_DISABLED:-false}
+  volumes: [bot-data:/data]
+  secrets: [bot_access_token, bot_device_id, gateway_secret, crypto_store_key]
+  depends_on:
+    rabbitmq:
+      condition: service_healthy
+    admin-gateway:
+      condition: service_started
+
+services:
+  observer:
+    <<: *bot
+    command: [observer]
+    healthcheck:
+      test: [CMD, retentionbot, health]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+
+  worker:
+    <<: *bot
+    command: [worker]
+
+  admin-gateway:
+    build: .
+    image: retentionbot:0.1.0
+    command: [gateway]
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      MATRIX_HOMESERVER: ${MATRIX_HOMESERVER}
+      MATRIX_SERVER_NAME: ${MATRIX_SERVER_NAME}
+      BOT_USER_ID: ${BOT_USER_ID}
+      GATEWAY_SECRET_FILE: /run/secrets/gateway_secret
+      SYNAPSE_ADMIN_TOKEN_FILE: /run/secrets/synapse_admin_token
+      RABBITMQ_URL: amqp://unused
+    volumes: [gateway-data:/data]
+    secrets: [gateway_secret, synapse_admin_token]
+    # Admin gateway and AMQP ports are intentionally available only inside Compose.
+
+  rabbitmq:
+    image: rabbitmq:4.3.6-management
+    hostname: rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: retention
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    volumes: [rabbitmq-data:/var/lib/rabbitmq]
+    healthcheck:
+      test: [CMD, rabbitmq-diagnostics, -q, ping]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+secrets:
+  bot_access_token:
+    file: ./secrets/bot_access_token
+  bot_device_id:
+    file: ./secrets/bot_device_id
+  gateway_secret:
+    file: ./secrets/gateway_secret
+  crypto_store_key:
+    file: ./secrets/crypto_store_key
+  synapse_admin_token:
+    file: ./secrets/synapse_admin_token
+
+volumes:
+  bot-data:
+  gateway-data:
+  rabbitmq-data:

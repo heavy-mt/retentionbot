@@ -1,0 +1,5 @@
+**
+!pyproject.toml
+!src/
+!src/retentionbot/
+!src/retentionbot/*.py

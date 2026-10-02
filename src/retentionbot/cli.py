@@ -2,50 +2,31 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import getpass
 import json
 import logging
 import os
 import signal
 from pathlib import Path
 
-from nio import AsyncClient, AsyncClientConfig, ErrorResponse
+import aiohttp
 
-from . import gateway, service, worker
+from . import service, worker
+from .api import PREFIX, ApiError, JsonApi
 from .config import Config, base_url
 from .jsonlog import JsonFormatter
 from .store import Store, now_ms
 
 
-async def login(args):
-    """Create a real device. An admin impersonation token is unsuitable for E2EE."""
-    directory = Path(args.output)
-    directory.mkdir(parents=True, exist_ok=True)
-    client = AsyncClient(
-        base_url(args.homeserver), args.user, config=AsyncClientConfig(encryption_enabled=False)
-    )
-    try:
-        response = await client.login(
-            password=getpass.getpass("Пароль бота: "), device_name="Retentionbot"
+async def command(args):
+    body = json.loads(args.json)
+    if not isinstance(body, dict):
+        raise ValueError("Command must be a JSON object")
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        api = JsonApi(
+            base_url(args.synapse_url), Path(args.token_file).read_text().strip(), session
         )
-        if isinstance(response, ErrorResponse):
-            raise RuntimeError(f"Login failed: {response.status_code}")
-        for name, value in {
-            "bot_access_token": response.access_token,
-            "bot_device_id": response.device_id,
-        }.items():
-            path = directory / name
-            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(descriptor, "w") as output:
-                output.write(value + "\n")
-        print(
-            json.dumps(
-                {"ok": True, "message": "Сохранены bot_access_token и bot_device_id."},
-                ensure_ascii=False,
-            )
-        )
-    finally:
-        await client.close()
+        result = await api.request("POST", PREFIX + "/command", json=body)
+        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
 
 
 async def supervise(coroutine):
@@ -60,55 +41,65 @@ async def supervise(coroutine):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Matrix retention service")
+    parser = argparse.ArgumentParser(description="Server-side Matrix retention service")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("observer", "worker", "gateway", "status", "health"):
+    for name in ("observer", "worker", "status", "health"):
         sub.add_parser(name)
-    auth = sub.add_parser("login")
-    auth.add_argument("--homeserver", required=True)
-    auth.add_argument("--user", required=True)
-    auth.add_argument("--output", default="secrets")
+    cmd = sub.add_parser("command")
+    cmd.add_argument("--synapse-url", default=os.getenv("SYNAPSE_URL"))
+    cmd.add_argument("--token-file", required=True)
+    cmd.add_argument("--json", required=True)
     args = parser.parse_args()
     os.umask(0o077)
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
     for handler in logging.getLogger().handlers:
         handler.setFormatter(JsonFormatter())
-    # Matrix-nio debug logging may contain events. AMQP logs may contain connection URLs.
-    for name in ("nio", "aio_pika", "aiormq"):
+    for name in ("aio_pika", "aiormq"):
         logging.getLogger(name).setLevel(logging.CRITICAL)
-    if args.command == "login":
-        asyncio.run(login(args))
-        return
     try:
+        if args.command == "command":
+            asyncio.run(command(args))
+            return
         config = Config.from_env()
-    except Exception as error:
-        logging.error("Configuration failed: %s; check .env and secret files", type(error).__name__)
-        raise SystemExit(1) from None
-    if args.command in {"status", "health"}:
-        store = Store(config.database_url or config.data_dir / "retention.db")
-        try:
-            if args.command == "health":
-                last_sync = int(store.get("last_sync_at") or "0")
-                raise SystemExit(0 if now_ms() - last_sync < 90_000 else 1)
-            counts = store.counts()
-            counts.update(
-                coverage_ok=store.get("coverage_ok") == "1",
-                last_sync_at=store.get("last_sync_at"),
-                rooms=[dict(row) for row in store.db.execute("SELECT * FROM rooms")],
-            )
-            print(json.dumps(counts, ensure_ascii=False))
-        finally:
-            store.close()
-        return
-    entry = {"observer": service.run, "worker": worker.run, "gateway": gateway.serve}[args.command]
-    try:
+        if args.command in {"status", "health"}:
+            store = Store(config.database_url or config.data_dir / "server.db")
+            try:
+                last_poll = int(store.get("last_poll_at") or 0)
+                if args.command == "health":
+                    raise SystemExit(0 if now_ms() - last_poll < 90_000 else 1)
+                print(
+                    json.dumps(
+                        {
+                            "counts": store.counts(),
+                            "last_poll_at": last_poll,
+                            "cursor": store.get("cursor"),
+                            "since_ts": store.get("since_ts"),
+                            "rooms": list(store.db.execute("SELECT * FROM rooms")),
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                )
+            finally:
+                store.close()
+            return
+        entry = {"observer": service.run, "worker": worker.run}[args.command]
         asyncio.run(supervise(entry(config)))
+    except ApiError as error:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "code": error.code,
+                    "message": error.message or "Сервер отклонил запрос.",
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+        raise SystemExit(1) from None
     except Exception as error:
-        # Do not interpolate credential-bearing exception values.
-        logging.error("Service startup failed: %s", type(error).__name__)
+        logging.error("Служба завершилась с ошибкой", extra={"code": type(error).__name__})
         raise SystemExit(1) from None
 
 

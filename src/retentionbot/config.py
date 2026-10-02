@@ -5,8 +5,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-PERIODS = {"1h": 3_600_000, "1d": 86_400_000, "7d": 604_800_000, "30d": 2_592_000_000}
-
 
 def secret(name: str, required: bool = True) -> str:
     filename = os.getenv(name + "_FILE")
@@ -26,7 +24,7 @@ def positive(name: str, default: int) -> int:
 def base_url(value: str) -> str:
     parts = urlsplit(value)
     if parts.scheme not in {"http", "https"} or not parts.netloc or parts.username:
-        raise ValueError("Invalid homeserver/gateway URL")
+        raise ValueError("Invalid Synapse URL")
     if parts.query or parts.fragment or parts.path not in {"", "/"}:
         raise ValueError("URL must be a server origin without path, query or fragment")
     return value.rstrip("/")
@@ -34,56 +32,24 @@ def base_url(value: str) -> str:
 
 @dataclass(frozen=True)
 class Config:
-    homeserver: str
-    server_name: str
-    user_id: str
-    gateway_url: str
-    gateway_secret: str
-    retention_config_file: Path | None = None
+    synapse_url: str
+    module_secret: str
     database_url: str = ""
     rabbitmq_url: str = "amqp://guest:guest@localhost/"
-    data_dir: Path = Path("data")
-    default_period: str = "7d"
+    data_dir: Path = Path("/data")
     poll_seconds: int = 1
-    discover_seconds: int = 60
-    admin_power_level: int = 100
-    redaction_lead_ms: int = 300_000
-    media_grace_seconds: int = 60
-    trust_devices: str = "tofu"
-
-    @property
-    def default_lifetime(self) -> int | None:
-        return None if self.default_period == "off" else PERIODS[self.default_period]
+    refresh_seconds: int = 60
+    batch_size: int = 1000
 
     @classmethod
     def from_env(cls) -> Config:
-        server_name = os.environ["MATRIX_SERVER_NAME"]
-        user_id = os.environ["BOT_USER_ID"]
-        if not user_id.startswith("@") or user_id.split(":", 1)[-1] != server_name:
-            raise ValueError("BOT_USER_ID must be local to MATRIX_SERVER_NAME")
-        period = os.getenv("DEFAULT_RETENTION", "7d")
-        if period not in {*PERIODS, "off"}:
-            raise ValueError("DEFAULT_RETENTION must be 1h, 1d, 7d, 30d or off")
-        trust = os.getenv("DEVICE_TRUST", "tofu")
-        if trust not in {"tofu", "verified"}:
-            raise ValueError("DEVICE_TRUST must be tofu or verified")
         return cls(
-            homeserver=base_url(os.environ["MATRIX_HOMESERVER"]),
-            server_name=server_name,
-            user_id=user_id,
-            gateway_url=base_url(os.getenv("GATEWAY_URL", "http://admin-gateway:8080")),
-            gateway_secret=secret("GATEWAY_SECRET"),
-            rabbitmq_url=secret("RABBITMQ_URL"),
-            retention_config_file=Path(os.environ["SYNAPSE_RETENTION_CONFIG_FILE"])
-            if os.getenv("SYNAPSE_RETENTION_CONFIG_FILE")
-            else None,
+            synapse_url=base_url(os.environ["SYNAPSE_URL"]),
+            module_secret=secret("SYNAPSE_MODULE_SECRET"),
             database_url=secret("DATABASE_URL", required=False),
+            rabbitmq_url=secret("RABBITMQ_URL"),
             data_dir=Path(os.getenv("DATA_DIR", "/data")),
-            default_period=period,
             poll_seconds=positive("POLL_SECONDS", 1),
-            discover_seconds=positive("DISCOVER_SECONDS", 60),
-            admin_power_level=positive("ROOM_ADMIN_POWER_LEVEL", 100),
-            redaction_lead_ms=positive("REDACTION_LEAD_SECONDS", 300) * 1000,
-            media_grace_seconds=positive("MEDIA_GRACE_SECONDS", 60),
-            trust_devices=trust,
+            refresh_seconds=positive("REFRESH_SECONDS", 60),
+            batch_size=min(positive("BATCH_SIZE", 1000), 5000),
         )

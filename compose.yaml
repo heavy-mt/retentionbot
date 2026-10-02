@@ -1,42 +1,31 @@
-x-bot: &bot
+x-service: &service
   build: .
-  image: retentionbot:0.1.0
+  image: retentionbot:0.2.0
   restart: unless-stopped
   read_only: true
   tmpfs: [/tmp]
   cap_drop: [ALL]
   security_opt: [no-new-privileges:true]
-  environment: &bot-env
-    MATRIX_HOMESERVER: ${MATRIX_HOMESERVER:?Set MATRIX_HOMESERVER}
-    MATRIX_SERVER_NAME: ${MATRIX_SERVER_NAME:?Set MATRIX_SERVER_NAME}
-    BOT_USER_ID: ${BOT_USER_ID:?Set BOT_USER_ID}
-    BOT_ACCESS_TOKEN_FILE: /run/secrets/bot_access_token
-    BOT_DEVICE_ID_FILE: /run/secrets/bot_device_id
-    GATEWAY_SECRET_FILE: /run/secrets/gateway_secret
-    CRYPTO_STORE_KEY_FILE: /run/secrets/crypto_store_key
-    GATEWAY_URL: http://admin-gateway:8080
+  environment:
+    SYNAPSE_URL: ${SYNAPSE_URL:?Set SYNAPSE_URL}
+    SYNAPSE_MODULE_SECRET_FILE: /run/secrets/synapse_module_secret
     DATABASE_URL: postgresql://retention:${DATABASE_PASSWORD:?Set DATABASE_PASSWORD}@postgres:5432/retentionbot
     RABBITMQ_URL: amqp://retention:${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD}@rabbitmq:5672/retention
-    DEVICE_TRUST: ${DEVICE_TRUST:-tofu}
     POLL_SECONDS: ${POLL_SECONDS:-1}
-    DISCOVER_SECONDS: ${DISCOVER_SECONDS:-60}
-    REDACTION_LEAD_SECONDS: ${REDACTION_LEAD_SECONDS:-300}
-    MEDIA_GRACE_SECONDS: ${MEDIA_GRACE_SECONDS:-60}
-    ROOM_ADMIN_POWER_LEVEL: ${ROOM_ADMIN_POWER_LEVEL:-100}
-  volumes: [bot-data:/data]
-  secrets: [bot_access_token, bot_device_id, gateway_secret, crypto_store_key]
-  networks: [outbound, broker, state]
+    REFRESH_SECONDS: ${REFRESH_SECONDS:-60}
+    BATCH_SIZE: ${BATCH_SIZE:-1000}
+  volumes: [service-data:/data]
+  secrets: [synapse_module_secret]
+  networks: [synapse, broker, state]
   depends_on:
     postgres:
       condition: service_healthy
     rabbitmq:
       condition: service_healthy
-    admin-gateway:
-      condition: service_healthy
 
 services:
   observer:
-    <<: *bot
+    <<: *service
     command: [observer]
     healthcheck:
       test: [CMD, retentionbot, health]
@@ -45,40 +34,8 @@ services:
       start_period: 120s
       retries: 3
   worker:
-    <<: *bot
+    <<: *service
     command: [worker]
-    secrets: [bot_access_token, gateway_secret]
-  admin-gateway:
-    build: .
-    image: retentionbot:0.1.0
-    command: [gateway]
-    restart: unless-stopped
-    read_only: true
-    tmpfs: [/tmp]
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    environment:
-      MATRIX_HOMESERVER: ${MATRIX_HOMESERVER}
-      MATRIX_SERVER_NAME: ${MATRIX_SERVER_NAME}
-      BOT_USER_ID: ${BOT_USER_ID}
-      GATEWAY_SECRET_FILE: /run/secrets/gateway_secret
-      SYNAPSE_ADMIN_TOKEN_FILE: /run/secrets/synapse_admin_token
-      SYNAPSE_RETENTION_CONFIG_FILE: /etc/retentionbot/synapse.yaml
-      DATABASE_URL: postgresql://retention:${DATABASE_PASSWORD}@postgres:5432/retentionbot
-      RABBITMQ_URL: amqp://unused
-    volumes:
-      - ${SYNAPSE_RETENTION_CONFIG_PATH:?Set SYNAPSE_RETENTION_CONFIG_PATH}:/etc/retentionbot/synapse.yaml:ro
-    secrets: [gateway_secret, synapse_admin_token]
-    healthcheck:
-      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
-      interval: 10s
-      timeout: 5s
-      start_period: 20s
-      retries: 5
-    networks: [outbound, state]
-    depends_on:
-      postgres:
-        condition: service_healthy
   rabbitmq:
     image: rabbitmq:4.3.6
     hostname: rabbitmq
@@ -114,25 +71,19 @@ services:
       retries: 10
 
 secrets:
-  bot_access_token:
-    file: ./secrets/bot_access_token
-  bot_device_id:
-    file: ./secrets/bot_device_id
-  gateway_secret:
-    file: ./secrets/gateway_secret
-  crypto_store_key:
-    file: ./secrets/crypto_store_key
-  synapse_admin_token:
-    file: ./secrets/synapse_admin_token
+  synapse_module_secret:
+    file: ./secrets/synapse_module_secret
   postgres_admin_password:
     file: ./secrets/postgres_admin_password
 
 volumes:
-  bot-data:
+  service-data:
   rabbitmq-data:
   postgres-data:
 networks:
-  outbound:
+  synapse:
+    external: true
+    name: ${SYNAPSE_NETWORK:-matrix_net}
   broker:
     internal: true
   state:

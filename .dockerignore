@@ -3,3 +3,5 @@
 !src/
 !src/retentionbot/
 !src/retentionbot/*.py
+!src/synapse_retention/
+!src/synapse_retention/*.py

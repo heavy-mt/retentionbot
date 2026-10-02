@@ -41,26 +41,3 @@ def test_json_log_is_one_line_even_with_newlines_and_exception():
     assert record["event"] == "job.retry"
     assert record["error_type"] == "RuntimeError"
     assert "sensitive" not in output.getvalue()
-
-
-def test_minimum_delays_a_late_edit_even_when_original_is_expired(store):
-    store.record("!room:example.org", "$original", 100, kind="m.room.message")
-    store.record("!room:example.org", "$edit", 1000, kind="m.replace", parent="$original")
-    store.policy("!room:example.org", 500, 1000)
-    assert not store.event_due("$edit", 1499)
-    assert store.event_due("$edit", 1500)
-
-
-def test_missing_keys_do_not_prevent_client_redaction(store):
-    store.record(
-        "!room:example.org",
-        "$encrypted",
-        100,
-        kind="m.room.encrypted",
-        decoded=False,
-        ciphertext={"ciphertext": "encrypted"},
-    )
-    assert store.event_due("$encrypted", 1100)
-    store.mark_redacted("$encrypted", 0)
-    assert store.undecoded()[0]["event_id"] == "$encrypted"
-    assert store.counts()["missing_keys"] == 1

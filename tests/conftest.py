@@ -1,5 +1,4 @@
 import os
-from pathlib import Path
 
 import pytest
 
@@ -17,21 +16,12 @@ def backend(request, monkeypatch):
 
 @pytest.fixture
 def config(tmp_path):
-    return Config(
-        homeserver="http://localhost:8008",
-        server_name="example.org",
-        user_id="@retention:example.org",
-        gateway_url="http://localhost:8080",
-        gateway_secret="test-secret",
-        data_dir=tmp_path,
-        default_period="off",
-        redaction_lead_ms=0,
-    )
+    return Config(synapse_url="http://localhost:8008", module_secret="x" * 64, data_dir=tmp_path)
 
 
 @pytest.fixture
-def store(tmp_path: Path):
-    db = open_store(tmp_path / "retention.db")
-    db.enroll("!room:example.org", 1000, since_ts=0)
+def store(tmp_path):
+    db = open_store(tmp_path / "server.db")
+    db.bootstrap(0, 100)
     yield db
     db.close()

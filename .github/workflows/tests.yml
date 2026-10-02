@@ -33,12 +33,13 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install -e '.[dev]'
-      - run: python -m venv .synapse-env && .synapse-env/bin/pip install matrix-synapse==1.161.0
+      - run: python -m venv .synapse-env && .synapse-env/bin/pip install matrix-synapse==1.161.0 && .synapse-env/bin/pip install --no-deps -e .
       - run: ruff check src tests
       - run: pytest -q
         env:
           SYNAPSE_PYTHON: .synapse-env/bin/python
           RABBITMQ_TEST_URL: amqp://test:disposable-test-password@localhost:5672/
           TEST_DATABASE_URL: postgresql://test:disposable-test-password@localhost:5432/retentiontest
-      - run: docker build -t retentionbot:0.1.0 .
+      - run: docker build -t retentionbot:0.2.0 .
+      - run: docker build -f deploy/Dockerfile.synapse -t retention-synapse:1.161.0 .
       - run: bash .github/smoke-compose.sh

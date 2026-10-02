@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "matrix-retentionbot"
-version = "0.1.0"
-description = "Room-controlled Matrix message expiry and local attachment cleanup"
+version = "0.2.0"
+description = "Server-side Matrix retention notifications without bot membership"
 requires-python = ">=3.12"
-dependencies = ["matrix-nio[e2e]==0.26.0", "aiohttp>=3.12,<4", "aio-pika>=9.5,<10", "psycopg[binary]>=3.2,<4", "PyYAML>=6,<7"]
+dependencies = ["aiohttp>=3.12,<4", "aio-pika>=9.5,<10", "psycopg[binary]>=3.2,<4", "PyYAML>=6,<7"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<9", "pytest-asyncio>=1,<2", "ruff>=0.9,<1", "PyYAML>=6,<7"]
+dev = ["pytest>=8,<9", "pytest-asyncio>=1,<2", "ruff>=0.9,<1", "PyYAML>=6,<7", "matrix-nio[e2e]==0.26.0"]
 
 [project.scripts]
 retentionbot = "retentionbot.cli:main"

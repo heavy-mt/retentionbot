@@ -1,11 +1,13 @@
-"""Opt-in tests against real Synapse and RabbitMQ. All credentials are disposable."""
+"""Real Synapse integration: no bot user, no extra member, no decryption by the service."""
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import hmac
+import json
 import os
+import socket
 import sqlite3
 import subprocess
 from dataclasses import replace
@@ -18,22 +20,19 @@ import pytest
 import yaml
 from nio import AsyncClient, AsyncClientConfig, ErrorResponse
 
-from retentionbot.api import GatewayApi, JsonApi, MatrixApi, segment
+from retentionbot.api import PREFIX, ApiError, JsonApi, ServerApi, segment
 from retentionbot.broker import Broker
-from retentionbot.gateway import AdminGateway
-from retentionbot.service import Service
+from retentionbot.service import Observer
 from retentionbot.store import now_ms
 from retentionbot.worker import Worker
 
-from .db import open_store, snapshot
-from .test_gateway import start_app
+from .db import open_store
 
 pytestmark = [
     pytest.mark.integration,
-    pytest.mark.skipif(
-        not os.getenv("SYNAPSE_PYTHON"), reason="Set SYNAPSE_PYTHON for real server tests"
-    ),
+    pytest.mark.skipif(not os.getenv("SYNAPSE_PYTHON"), reason="Set SYNAPSE_PYTHON"),
 ]
+SECRET = "disposable-module-secret-" + "x" * 40
 
 
 @pytest.fixture
@@ -57,10 +56,8 @@ async def homeserver(tmp_path):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    (tmp_path / "module-secret").write_text(SECRET)
     data = yaml.safe_load(config.read_text())
-    # Free port allocated in the same network namespace as the subprocess and clients.
-    import socket
-
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -83,6 +80,16 @@ async def homeserver(tmp_path):
             "default_policy": {"max_lifetime": "7d"},
             "purge_jobs": [{"interval": 500}],
         },
+        modules=[
+            {
+                "module": "synapse_retention.module.RetentionModule",
+                "config": {
+                    "secret_file": str(tmp_path / "module-secret"),
+                    "cutoff_file": str(tmp_path / "retention-cutoff"),
+                    "redaction_lead": 1500,
+                },
+            }
+        ],
         redaction_retention_period=0,
         rc_message={"per_second": 1000, "burst_count": 10000},
         rc_registration={"per_second": 1000, "burst_count": 10000},
@@ -110,7 +117,7 @@ async def homeserver(tmp_path):
                 except aiohttp.ClientError:
                     pass
                 if process.poll() is not None:
-                    pytest.fail((tmp_path / "process.log").read_text()[-4000:])
+                    pytest.fail((tmp_path / "process.log").read_text()[-6000:])
                 await asyncio.sleep(0.2)
             else:
                 pytest.fail("Synapse startup timed out")
@@ -125,12 +132,12 @@ async def homeserver(tmp_path):
         output.close()
 
 
-async def register(base: str, user: str, admin: bool = False):
+async def register(base, user):
     async with aiohttp.ClientSession() as session:
         async with session.get(base + "/_synapse/admin/v1/register") as response:
             nonce = (await response.json())["nonce"]
         password = "disposable-integration-password"
-        message = "\0".join([nonce, user, password, "admin" if admin else "notadmin"])
+        message = "\0".join([nonce, user, password, "notadmin"])
         mac = hmac.new(b"integration-secret", message.encode(), hashlib.sha1).hexdigest()
         async with session.post(
             base + "/_synapse/admin/v1/register",
@@ -138,7 +145,7 @@ async def register(base: str, user: str, admin: bool = False):
                 "nonce": nonce,
                 "username": user,
                 "password": password,
-                "admin": admin,
+                "admin": False,
                 "mac": mac,
             },
         ) as response:
@@ -146,246 +153,311 @@ async def register(base: str, user: str, admin: bool = False):
             return await response.json()
 
 
-async def test_private_room_commands_redaction_and_physical_media(homeserver, config):
+async def dm(alice, bob, encrypted=False, room_version="10"):
+    initial = (
+        [
+            {
+                "type": "m.room.encryption",
+                "state_key": "",
+                "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+            }
+        ]
+        if encrypted
+        else []
+    )
+    room = (
+        await alice.request(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            json={
+                "preset": "private_chat",
+                "is_direct": True,
+                "room_version": room_version,
+                "invite": [bob.user_id],
+                "initial_state": initial,
+            },
+        )
+    )["room_id"]
+    await bob.request("POST", "/_matrix/client/v3/join/" + segment(room), json={})
+    return room
+
+
+async def people(base, session):
+    a, b = await register(base, "alice"), await register(base, "bob")
+    alice, bob = (
+        JsonApi(base, a["access_token"], session),
+        JsonApi(base, b["access_token"], session),
+    )
+    alice.user_id, bob.user_id = a["user_id"], b["user_id"]
+    return alice, bob, a, b
+
+
+async def setting(api, room, maximum=2000, minimum=100):
+    return await api.request(
+        "POST",
+        PREFIX + "/command",
+        json={
+            "command": "retention",
+            "action": "set",
+            "room_id": room,
+            "min_lifetime": minimum,
+            "max_lifetime": maximum,
+        },
+    )
+
+
+async def send(api, room, text, txn=None):
+    return (
+        await api.request(
+            "PUT",
+            f"/_matrix/client/v3/rooms/{segment(room)}/send/m.room.message/{txn or uuid4().hex}",
+            json={"msgtype": "m.text", "body": text},
+        )
+    )["event_id"]
+
+
+async def wait_due(store, key, delay=510):
+    delta = store.event(key)["ts"] + delay - now_ms()
+    if delta > 0:
+        await asyncio.sleep(delta / 1000)
+
+
+@pytest.mark.parametrize("room_version", ["10", "12"])
+async def test_dm_only_two_members_admin_json_and_redaction_sync(homeserver, config, room_version):
     base, path = homeserver
-    human = await register(base, "human", admin=True)
-    bot = await register(base, "retention")
-    user = await register(base, "member")
-    config = replace(
-        config,
-        homeserver=base,
-        server_name="test.local",
-        user_id=bot["user_id"],
-        media_grace_seconds=1,
-        retention_config_file=path / "homeserver.yaml",
-    )
-    store = open_store(path / "retention.db")
-    gateway_store = open_store(path / "gateway.db")
-    client = AsyncClient(
-        base,
-        bot["user_id"],
-        store_path=str(path),
-        config=AsyncClientConfig(encryption_enabled=True, pickle_key="test-key", request_timeout=5),
-    )
-    client.restore_login(bot["user_id"], bot["device_id"], bot["access_token"])
+    store = open_store(path / "metadata.db")
     async with aiohttp.ClientSession() as session:
-        admin = JsonApi(base, human["access_token"], session)
-        runner, gateway_url = await start_app(AdminGateway(config, admin, gateway_store).app())
-        gateway = GatewayApi(gateway_url, config.gateway_secret, session)
-        human_api = MatrixApi(base, human["access_token"], session)
-        bot_api = MatrixApi(base, bot["access_token"], session)
-        service = Service(config, store, client, bot_api, gateway, AsyncMock())
-        try:
-            room = (
-                await human_api.request(
-                    "POST", "/_matrix/client/v3/createRoom", json={"preset": "private_chat"}
-                )
-            )["room_id"]
-            prefix = f"/_matrix/client/v3/rooms/{segment(room)}"
-            await human_api.request(
-                "PUT",
-                prefix + "/send/m.room.message/old",
-                json={"msgtype": "m.text", "body": "old history"},
-            )
-            await service.discover()
-            await service.sync_once()
-            assert store.room(room)
-            assert not store.counts()["total"]  # Old history is outside scope.
-            assert (await bot_api.power_levels(room))["users"][bot["user_id"]] == 50
-            await human_api.request("POST", prefix + "/invite", json={"user_id": user["user_id"]})
-            member_api = MatrixApi(base, user["access_token"], session)
-            await member_api.request("POST", f"/_matrix/client/v3/join/{segment(room)}", json={})
-            await member_api.request(
-                "PUT",
-                prefix + "/send/m.room.message/denied",
-                json={"msgtype": "m.text", "body": '{"command":"retention","action":"off"}'},
-            )
-            await service.sync_once()
-            assert store.room(room)["lifetime"] == 604_800_000
-            await human_api.request(
-                "PUT",
-                prefix + "/send/m.room.message/setting",
-                json={
-                    "msgtype": "m.text",
-                    "body": '{"command":"retention","action":"set","max_lifetime":"1h"}',
-                },
-            )
-            await service.sync_once()
-            assert store.room(room)["lifetime"] == 3_600_000
-            missed = []
-            for i in range(125):
-                sent = await human_api.request(
-                    "PUT",
-                    prefix + f"/send/m.room.message/gap-{i}",
-                    json={"msgtype": "m.text", "body": f"gap test {i}"},
-                )
-                missed.append(sent["event_id"])
-            await service.sync_once()
-            for event_id in missed:
-                assert store.db.execute(
-                    "SELECT 1 FROM events WHERE event_id=?", (event_id,)
-                ).fetchone()
-            async with session.post(
-                base + "/_matrix/media/v3/upload",
-                headers={
-                    "Authorization": "Bearer " + human["access_token"],
-                    "Content-Type": "application/octet-stream",
-                },
-                data=b"disposable test attachment",
-            ) as response:
-                assert response.status == 200
-                uri = (await response.json())["content_uri"]
-            sent = await human_api.request(
-                "PUT",
-                prefix + "/send/m.room.message/file",
-                json={"msgtype": "m.file", "body": "test.bin", "url": uri},
-            )
-            await service.sync_once()
-            # Test clock: change the per-room lifetime without waiting an hour.
-            with store.db:
-                store.db.execute(
-                    "UPDATE events SET ts=0,anchor_ts=0 WHERE event_id=?", (sent["event_id"],)
-                )
-            await asyncio.sleep(0.01)
-            worker = Worker(config, store, bot_api, gateway)
-            await worker.handle("redact", sent["event_id"])
-            event = await human_api.request("GET", prefix + f"/event/{segment(sent['event_id'])}")
-            assert not event["content"]
-            store.set("last_sync_at", str(now_ms()))
-            with store.db:
-                store.db.execute("UPDATE media SET next_try=0")
-            await worker.handle("media", uri)
-            assert store.db.execute("SELECT deleted FROM media WHERE uri=?", (uri,)).fetchone()[0]
-            media_id = uri.rsplit("/", 1)[1]
-            assert not list((path / "media" / "local_content").rglob(media_id[4:]))
-            async with session.get(
-                base + f"/_matrix/client/v1/media/download/test.local/{media_id}",
-                headers={"Authorization": "Bearer " + human["access_token"]},
-            ) as r:
-                assert r.status == 404
-        finally:
-            await client.close()
-            await runner.cleanup()
-            store.close()
-            gateway_store.close()
+        alice, bob, _, _ = await people(base, session)
+        room = await dm(alice, bob, room_version=room_version)
+        old = await send(alice, room, "before monitoring")
+        api = ServerApi(base, SECRET, session)
+        observer = Observer(replace(config, synapse_url=base), store, api, AsyncMock())
+        await observer.poll_once()
+        assert store.event(old) is None
+        await setting(alice, room)
+        with pytest.raises(ApiError) as error:
+            await setting(bob, room)
+        assert error.value.code == "NOT_ROOM_ADMIN"
+        first = await send(alice, room, "alice message")
+        second = await send(bob, room, "bob message")
+        await observer.poll_once()
+        before = await alice.request("GET", "/_matrix/client/v3/sync", params={"timeout": "0"})
+        devices = (await bob.request("GET", "/_matrix/client/v3/devices"))["devices"]
+        await wait_due(store, second)
+        worker = Worker(store, api)
+        await asyncio.gather(worker.handle(first), worker.handle(first))
+        await worker.handle(second)
+        await worker.handle(first)
+        assert store.counts() == {"done": 2}
+        sync = await alice.request(
+            "GET",
+            "/_matrix/client/v3/sync",
+            params={"since": before["next_batch"], "timeout": "100"},
+        )
+        timeline = sync["rooms"]["join"][room]["timeline"]["events"]
+        removed = {
+            e.get("redacts", e["content"].get("redacts"))
+            for e in timeline
+            if e["type"] == "m.room.redaction"
+        }
+        assert {first, second} <= removed
+        members = await alice.request(
+            "GET", f"/_matrix/client/v3/rooms/{segment(room)}/joined_members"
+        )
+        assert set(members["joined"]) == {alice.user_id, bob.user_id}
+        assert len((await bob.request("GET", "/_matrix/client/v3/devices"))["devices"]) == len(
+            devices
+        )
+        repeat = await api.redact(first)
+        assert repeat["redaction_id"] == store.event(first)["redaction_id"]
+        assert "alice message" not in json.dumps(
+            list(store.db.execute("SELECT * FROM events")), ensure_ascii=False
+        )
+    store.close()
 
 
-async def test_e2ee_commands_and_attachment_metadata(homeserver, config):
+async def test_real_e2ee_dm_without_server_keys(homeserver, config):
     base, path = homeserver
-    human = await register(base, "human", admin=True)
-    bot = await register(base, "retention")
-    config = replace(
-        config,
-        homeserver=base,
-        server_name="test.local",
-        user_id=bot["user_id"],
-        retention_config_file=path / "homeserver.yaml",
-    )
-    store = open_store(path / "retention.db")
-    gateway_store = open_store(path / "gateway.db")
+    store = open_store(path / "encrypted.db")
     clients = []
-    for identity in [human, bot]:
-        crypto = path / identity["user_id"].split(":")[0].removeprefix("@")
-        crypto.mkdir()
-        client = AsyncClient(
-            base,
-            identity["user_id"],
-            store_path=str(crypto),
-            config=AsyncClientConfig(
-                encryption_enabled=True, pickle_key="test-key", request_timeout=5
-            ),
-        )
-        client.restore_login(identity["user_id"], identity["device_id"], identity["access_token"])
-        clients.append(client)
-    sender, observer = clients
     async with aiohttp.ClientSession() as session:
-        admin = MatrixApi(base, human["access_token"], session)
-        runner, gateway_url = await start_app(AdminGateway(config, admin, gateway_store).app())
-        gateway = GatewayApi(gateway_url, config.gateway_secret, session)
-        service = Service(
-            config,
-            store,
-            observer,
-            MatrixApi(base, bot["access_token"], session),
-            gateway,
-            AsyncMock(),
-        )
+        alice, bob, a, b = await people(base, session)
+        room = await dm(alice, bob, encrypted=True)
+        for user in (a, b):
+            directory = path / user["user_id"].split(":")[0][1:]
+            directory.mkdir()
+            client = AsyncClient(
+                base,
+                user["user_id"],
+                store_path=str(directory),
+                config=AsyncClientConfig(encryption_enabled=True, pickle_key="disposable"),
+            )
+            client.restore_login(user["user_id"], user["device_id"], user["access_token"])
+            clients.append(client)
+        sender, recipient = clients
         try:
-            room = (
-                await admin.request(
-                    "POST",
-                    "/_matrix/client/v3/createRoom",
-                    json={
-                        "preset": "private_chat",
-                        "initial_state": [
-                            {
-                                "type": "m.room.encryption",
-                                "state_key": "",
-                                "content": {"algorithm": "m.megolm.v1.aes-sha2"},
-                            }
-                        ],
-                    },
-                )
-            )["room_id"]
-            await service.discover()
-            await service.sync_once()
-            await sender.sync(timeout=0)
-            if sender.should_upload_keys:
-                await sender.keys_upload()
-            await sender.keys_query()
-            for device in sender.device_store.active_user_devices(bot["user_id"]):
+            for client in clients:
+                await client.sync(timeout=0)
+                if client.should_upload_keys:
+                    await client.keys_upload()
+            for client in clients:
+                await client.keys_query()
+            for device in sender.device_store.active_user_devices(bob.user_id):
                 sender.verify_device(device)
+            api = ServerApi(base, SECRET, session)
+            observer = Observer(replace(config, synapse_url=base), store, api, AsyncMock())
+            await observer.poll_once()
             sent = await sender.room_send(
                 room,
                 "m.room.message",
-                {
-                    "msgtype": "m.text",
-                    "body": '{"command":"retention","action":"set","max_lifetime":"1d"}',
-                },
+                {"msgtype": "m.text", "body": "confidential plaintext known only to clients"},
             )
             assert not isinstance(sent, ErrorResponse)
-            await service.sync_once()
-            await service.retry_decryption()
-            await service.commands()
-            assert store.room(room)["lifetime"] == 86_400_000
-            sent_file = await sender.room_send(
-                room,
-                "m.room.message",
-                {
-                    "msgtype": "m.file",
-                    "body": "encrypted.bin",
-                    "file": {
-                        "url": "mxc://test.local/encryptedFile",
-                        "v": "v2",
-                        "key": {
-                            "kty": "oct",
-                            "key_ops": ["encrypt", "decrypt"],
-                            "alg": "A256CTR",
-                            "k": "A" * 43,
-                            "ext": True,
-                        },
-                        "iv": "A" * 22,
-                        "hashes": {"sha256": "A" * 43},
-                    },
-                },
+            decrypted = await recipient.sync(timeout=0)
+            assert any(
+                getattr(e, "body", "") == "confidential plaintext known only to clients"
+                for e in decrypted.rooms.join[room].timeline.events
             )
-            assert not isinstance(sent_file, ErrorResponse)
-            await service.sync_once()
-            await service.retry_decryption()
-            assert store.db.execute(
-                "SELECT uri FROM media WHERE uri=?", ("mxc://test.local/encryptedFile",)
-            ).fetchone()
-            assert "encrypted.bin" not in snapshot(store)
+            await setting(alice, room)
+            await observer.poll_once()
+            row = store.event(sent.event_id)
+            assert row["kind"] == "m.room.encrypted"
+            snapshot = json.dumps(list(store.db.execute("SELECT * FROM events")))
+            assert "confidential" not in snapshot and "ciphertext" not in snapshot
+            await wait_due(store, sent.event_id)
+            await Worker(store, api).handle(sent.event_id)
+            assert store.event(sent.event_id)["status"] == "done"
+            synced = await recipient.sync(timeout=0)
+            assert any(
+                e.source.get("type") == "m.room.redaction"
+                and e.source.get("redacts", e.source["content"].get("redacts")) == sent.event_id
+                for e in synced.rooms.join[room].timeline.events
+            )
+            members = await alice.request(
+                "GET", f"/_matrix/client/v3/rooms/{segment(room)}/joined_members"
+            )
+            assert set(members["joined"]) == {alice.user_id, bob.user_id}
         finally:
             for client in clients:
                 await client.close()
-            await runner.cleanup()
-            store.close()
-            gateway_store.close()
+    store.close()
+
+
+async def test_departed_local_author_and_state_protection(homeserver):
+    base, _ = homeserver
+    async with aiohttp.ClientSession() as session:
+        alice, bob, _, _ = await people(base, session)
+        room = await dm(alice, bob)
+        await setting(alice, room)
+        target = await send(bob, room, "departed author's message")
+        state = (
+            await alice.request(
+                "PUT",
+                f"/_matrix/client/v3/rooms/{segment(room)}/state/m.room.topic",
+                json={"topic": "must stay"},
+            )
+        )["event_id"]
+        await bob.request("POST", f"/_matrix/client/v3/rooms/{segment(room)}/leave", json={})
+        await asyncio.sleep(0.6)
+        api = ServerApi(base, SECRET, session)
+        assert (await api.redact(state))["code"] == "EVENT_TYPE_EXCLUDED"
+        result = await api.redact(target)
+        assert result["status"] == "done", result
+        assert result["sender"] == bob.user_id
+        members = await alice.request(
+            "GET", f"/_matrix/client/v3/rooms/{segment(room)}/joined_members"
+        )
+        assert set(members["joined"]) == {alice.user_id}
+        assert (await api.redact("$unknown"))["status"] == "missed"
+
+
+async def test_server_rechecks_extended_policy_and_secret_scope(homeserver):
+    base, _ = homeserver
+    async with aiohttp.ClientSession() as session:
+        alice, bob, _, _ = await people(base, session)
+        room = await dm(alice, bob)
+        await setting(alice, room)
+        target = await send(alice, room, "new deadline")
+        await asyncio.sleep(0.6)
+        await setting(alice, room, maximum="1h")
+        api = ServerApi(base, SECRET, session)
+        assert (await api.redact(target))["status"] == "deferred"
+        with pytest.raises(ApiError) as error:
+            await ServerApi(base, alice.token, session).feed(None)
+        assert error.value.status == 401
+        with pytest.raises(ApiError):
+            await api.request(
+                "POST",
+                PREFIX + "/command",
+                json={"command": "retention", "action": "status", "room_id": room},
+            )
+        with pytest.raises(ApiError) as error:
+            await setting(alice, room, maximum=1000, minimum=1000)
+        assert error.value.code == "BAD_POLICY"
+        with pytest.raises(ApiError):
+            await alice.request(
+                "POST",
+                PREFIX + "/command",
+                json={"command": "retention", "action": [], "room_id": room},
+            )
+
+
+async def test_cursor_recovers_many_events_without_bodies(homeserver, config):
+    base, path = homeserver
+    store = open_store(path / "catchup.db")
+    async with aiohttp.ClientSession() as session:
+        alice, bob, _, _ = await people(base, session)
+        room = await dm(alice, bob)
+        api = ServerApi(base, SECRET, session)
+        observer = Observer(replace(config, batch_size=10), store, api, AsyncMock())
+        await observer.poll_once()
+        sent = {await send(alice, room, "private body") for _ in range(125)}
+        for _ in range(40):
+            if await observer.poll_once():
+                break
+        assert set(row["event_id"] for row in store.db.execute("SELECT * FROM events")) == sent
+        assert "private body" not in json.dumps(await api.feed(0, 5000))
+    store.close()
+
+
+@pytest.mark.parametrize("timing", ["before", "after"])
+async def test_native_purge_stays_enabled_and_late_job_is_not_success(homeserver, config, timing):
+    base, path = homeserver
+    store = open_store(path / "purge.db")
+    async with aiohttp.ClientSession() as session:
+        alice, bob, _, _ = await people(base, session)
+        room = await dm(alice, bob)
+        api = ServerApi(base, SECRET, session)
+        observer = Observer(config, store, api, AsyncMock())
+        await observer.poll_once()
+        await setting(alice, room)
+        target = await send(alice, room, "expires")
+        await send(alice, room, "anchor one")
+        await send(alice, room, "anchor two")
+        await observer.poll_once()
+        worker = Worker(store, api)
+        if timing == "before":
+            await wait_due(store, target)
+            await worker.handle(target)
+            assert store.event(target)["status"] == "done"
+        with sqlite3.connect(path / "synapse.db") as server_db:
+            for _ in range(100):
+                if not server_db.execute(
+                    "SELECT 1 FROM event_json WHERE event_id=?", (target,)
+                ).fetchone():
+                    break
+                await asyncio.sleep(0.1)
+            else:
+                pytest.fail("Native retention did not purge target")
+        if timing == "after":
+            await worker.handle(target)
+            assert store.event(target)["status"] == "missed"
+            assert store.event(target)["error"] == "EVENT_PURGED"
+    store.close()
 
 
 @pytest.mark.skipif(not os.getenv("RABBITMQ_TEST_URL"), reason="Set RABBITMQ_TEST_URL")
-async def test_real_rabbitmq_redelivery_and_persistent_job():
+async def test_real_rabbitmq_persistent_redelivery():
     broker = await Broker().connect(os.environ["RABBITMQ_TEST_URL"])
     key = "$integration-" + uuid4().hex
     try:
@@ -394,112 +466,28 @@ async def test_real_rabbitmq_redelivery_and_persistent_job():
         assert first.delivery_mode == 2
         await first.nack(requeue=True)
         second = await broker.queue.get(timeout=5)
-        assert second.redelivered
-        assert key.encode() in second.body
+        assert second.redelivered and key.encode() in second.body
         await second.ack()
     finally:
         await broker.close()
 
 
-@pytest.mark.parametrize("timing", ["before", "after"])
-async def test_native_purge_and_client_notification(homeserver, config, timing):
-    base, path = homeserver
-    human = await register(base, "human", admin=True)
-    bot = await register(base, "retention")
-    config = replace(
-        config,
-        homeserver=base,
-        server_name="test.local",
-        user_id=bot["user_id"],
-        retention_config_file=path / "homeserver.yaml",
-        redaction_lead_ms=1500 if timing == "before" else 0,
-    )
-    store, gateway_store = open_store(path / "retention.db"), open_store(path / "gateway.db")
-    client = AsyncClient(
-        base,
-        bot["user_id"],
-        store_path=str(path),
-        config=AsyncClientConfig(encryption_enabled=True, pickle_key="test-key"),
-    )
-    client.restore_login(bot["user_id"], bot["device_id"], bot["access_token"])
+async def test_existing_local_moderator_fallback(homeserver):
+    base, _ = homeserver
     async with aiohttp.ClientSession() as session:
-        admin = MatrixApi(base, human["access_token"], session)
-        runner, gateway_url = await start_app(AdminGateway(config, admin, gateway_store).app())
-        gateway, bot_api = (
-            GatewayApi(gateway_url, config.gateway_secret, session),
-            MatrixApi(base, bot["access_token"], session),
+        alice, bob, _, _ = await people(base, session)
+        room = await dm(alice, bob)
+        prefix = f"/_matrix/client/v3/rooms/{segment(room)}/state/m.room.power_levels"
+        levels = await alice.request("GET", prefix)
+        levels.setdefault("events", {})["m.room.redaction"] = 100
+        await alice.request("PUT", prefix, json=levels)
+        await setting(alice, room)
+        target = await send(bob, room, "requires moderator")
+        await asyncio.sleep(0.6)
+        result = await ServerApi(base, SECRET, session).redact(target)
+        assert result["status"] == "done", result
+        assert result["sender"] == alice.user_id
+        members = await alice.request(
+            "GET", f"/_matrix/client/v3/rooms/{segment(room)}/joined_members"
         )
-        service = Service(config, store, client, bot_api, gateway, AsyncMock())
-        try:
-            room = (
-                await admin.request(
-                    "POST", "/_matrix/client/v3/createRoom", json={"preset": "private_chat"}
-                )
-            )["room_id"]
-            await service.discover()
-            await service.sync_once()
-            await admin.set_retention(room, {"min_lifetime": 100, "max_lifetime": 2000})
-            target = (
-                await admin.request(
-                    "PUT",
-                    f"/_matrix/client/v3/rooms/{segment(room)}/send/m.room.message/target",
-                    json={"msgtype": "m.text", "body": "expires natively"},
-                )
-            )["event_id"]
-            await service.sync_once()
-            assert store.db.execute("SELECT 1 FROM events WHERE event_id=?", (target,)).fetchone()
-            for i in range(2):
-                await admin.request(
-                    "PUT",
-                    f"/_matrix/client/v3/rooms/{segment(room)}/send/m.room.message/anchor{i}",
-                    json={"msgtype": "m.text", "body": "anchor"},
-                )
-            with sqlite3.connect(path / "synapse.db") as server_db:
-                if timing == "before":
-                    event = store.db.execute(
-                        "SELECT ts FROM events WHERE event_id=?", (target,)
-                    ).fetchone()
-                    delay = max(0, event["ts"] + 510 - now_ms()) / 1000
-                    await asyncio.sleep(delay)
-                    assert server_db.execute(
-                        "SELECT 1 FROM event_json WHERE event_id=?", (target,)
-                    ).fetchone()
-                    await Worker(config, store, bot_api, gateway).handle("redact", target)
-                    assert (
-                        store.db.execute(
-                            "SELECT redacted FROM events WHERE event_id=?", (target,)
-                        ).fetchone()[0]
-                        == 1
-                    )
-                    sync = await bot_api.request(
-                        "GET",
-                        "/_matrix/client/v3/sync",
-                        params={"since": store.get("sync_token"), "timeout": "100"},
-                    )
-                    timeline = sync["rooms"]["join"][room]["timeline"]["events"]
-                    assert any(
-                        e["type"] == "m.room.redaction"
-                        and e.get("redacts", e["content"].get("redacts")) == target
-                        for e in timeline
-                    )
-                # Actual native purge remains enabled after the bot's work.
-                for _ in range(100):
-                    if not server_db.execute(
-                        "SELECT 1 FROM event_json WHERE event_id=?", (target,)
-                    ).fetchone():
-                        break
-                    await asyncio.sleep(0.1)
-                else:
-                    pytest.fail("Native retention did not purge the target")
-                if timing == "after":
-                    await Worker(config, store, bot_api, gateway).handle("redact", target)
-                    row = store.db.execute(
-                        "SELECT * FROM events WHERE event_id=?", (target,)
-                    ).fetchone()
-                    assert row["redacted"] == 0
-                    assert row["error"] == "REDACTION_NOT_VISIBLE"
-        finally:
-            await client.close()
-            await runner.cleanup()
-            store.close()
-            gateway_store.close()
+        assert set(members["joined"]) == {alice.user_id, bob.user_id}

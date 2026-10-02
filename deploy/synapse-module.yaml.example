@@ -1,0 +1,29 @@
+# Add this module to the modules list that Synapse actually loads.
+# Every process serving these endpoints uses the same module config/secret/cutoff volume.
+modules:
+  - module: synapse_retention.module.RetentionModule
+    config:
+      secret_file: /data/retention-module-secret
+      cutoff_file: /data/retention-cutoff
+      redaction_lead: 5m
+      room_admin_power_level: 100
+
+# Keep the existing native retention policy. Example for a new test installation:
+retention:
+  enabled: true
+  default_policy:
+    min_lifetime: 1h
+    max_lifetime: 7d
+  allowed_lifetime_min: 1h
+  allowed_lifetime_max: 30d
+  purge_jobs:
+    - interval: 1h
+
+# Optional: erase redacted message content earlier. Native check runs every 5 minutes.
+redaction_retention_period: 0
+
+# Optional, separate policy: removes unused files after 30 days since last access.
+# This is NOT the message's deadline and applies across the media repository.
+# media_retention:
+#   local_media_lifetime: 30d
+#   remote_media_lifetime: 30d

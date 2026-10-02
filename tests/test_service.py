@@ -2,6 +2,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from retentionbot.api import ApiError
 from retentionbot.service import Observer
 
 from .test_queue import POLICY, ROOM, event
@@ -29,3 +30,25 @@ async def test_publish_failure_releases_lease(config, store):
     with pytest.raises(RuntimeError):
         await observer.schedule()
     assert store.event("$new")["queued_at"] == 0
+
+
+async def test_deleted_room_does_not_stall_other_rooms(config, store):
+    removed = "!deleted:example.org"
+    with store.db:
+        store.policy(removed, POLICY)
+    api = AsyncMock()
+    api.feed.return_value = {"events": [event()], "cursor": 25, "caught_up": True}
+
+    async def policy(room):
+        if room == removed:
+            raise ApiError(404, "M_NOT_FOUND")
+        return POLICY
+
+    api.policy.side_effect = policy
+    assert await Observer(config, store, api, AsyncMock()).poll_once()
+    assert store.get("cursor") == "25"
+    assert store.event("$new")
+    assert (
+        store.db.execute("SELECT error FROM rooms WHERE room_id=?", (removed,)).fetchone()[0]
+        == "ROOM_NOT_FOUND"
+    )

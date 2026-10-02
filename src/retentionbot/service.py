@@ -33,7 +33,19 @@ class Observer:
             rooms.update(
                 row["room_id"] for row in self.store.db.execute("SELECT room_id FROM rooms")
             )
-        policies = {room: await self.api.policy(room) for room in sorted(rooms)}
+        policies = {}
+        for room in sorted(rooms):
+            try:
+                policies[room] = await self.api.policy(room)
+            except ApiError as error:
+                if error.status != 404:
+                    raise
+                # Admin purge of one entire room must not stall the global event feed.
+                policies[room] = {
+                    "policy_error": "ROOM_NOT_FOUND",
+                    "redact_after_ms": None,
+                    "max_lifetime": None,
+                }
         self.store.ingest(page, policies)
         if refresh:
             self.last_refresh = at

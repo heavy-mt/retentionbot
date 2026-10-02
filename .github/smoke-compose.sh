@@ -12,6 +12,7 @@ done
 chmod 700 secrets
 chmod 444 secrets/*
 cleanup() {
+    docker logs --tail=80 synapse-smoke || true
     docker compose logs --tail=30 observer worker || true
     docker compose down -v || true
     docker rm -f synapse-smoke >/dev/null 2>&1 || true
@@ -19,7 +20,7 @@ cleanup() {
 }
 trap cleanup EXIT
 docker network create retention-smoke
-docker run --rm --entrypoint /usr/local/bin/python \
+docker run --rm --workdir /data --entrypoint /usr/local/bin/python \
     -v "$PWD/test-runtime/compose-synapse:/data" retention-synapse:1.161.0 \
     -m synapse.app.homeserver --server-name test.invalid \
     --config-path /data/homeserver.yaml --generate-config --report-stats=no
@@ -47,6 +48,21 @@ docker run -d --name synapse-smoke --network retention-smoke \
     -e SYNAPSE_CONFIG_PATH=/data/homeserver.yaml \
     -v "$PWD/test-runtime/compose-synapse:/data" \
     -v "$PWD/secrets/synapse_module_secret:/module-secret:ro" retention-synapse:1.161.0
+docker exec -i synapse-smoke /usr/local/bin/python - <<'PY'
+import time
+import urllib.error
+import urllib.request
+deadline = time.monotonic() + 60
+while True:
+    try:
+        with urllib.request.urlopen('http://localhost:8008/health', timeout=2) as response:
+            assert response.status == 200
+        break
+    except urllib.error.URLError:
+        if time.monotonic() >= deadline:
+            raise
+        time.sleep(1)
+PY
 docker compose config --quiet
 docker compose up -d --wait --wait-timeout 180
 docker compose exec -T observer python - <<'PY'

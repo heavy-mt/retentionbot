@@ -13,10 +13,12 @@ from synapse.api.errors import SynapseError
 from synapse.events.py_protocol import supports_msc4242_state_dag
 from synapse.http.server import JsonResource
 from synapse.http.servlet import parse_integer, parse_string
-from synapse.types import create_requester
+from synapse.types import UserID, create_requester
 
 from retentionbot.jsonlog import JsonFormatter
 from retentionbot.policy import ServerPolicy, duration
+
+from .commands import BotCommands
 
 PREFIX = "/_synapse/retention/v1"
 MESSAGE_TYPES = frozenset({"m.room.message", "m.room.encrypted", "m.reaction", "m.sticker"})
@@ -82,11 +84,15 @@ class RetentionModule:
         admin = config.get("room_admin_power_level", 100)
         if type(admin) is not int or admin < 1:
             raise ValueError("Invalid room_admin_power_level")
+        bot_user = config.get("command_bot_user_id")
+        if bot_user is not None:
+            UserID.from_string(bot_user)
         return {
             "secret_file": config["secret_file"],
             "lead_ms": lead,
             "admin_level": admin,
             "cutoff_file": config.get("cutoff_file", "/data/retention-cutoff"),
+            "bot_user": bot_user,
         }
 
     def __init__(self, config, api):
@@ -107,6 +113,9 @@ class RetentionModule:
         if len(self.secret) < 32:
             raise ValueError("Retention module secret must have at least 32 characters")
         self.lead_ms, self.admin_level = config["lead_ms"], config["admin_level"]
+        if config["bot_user"] and not self.hs.is_mine_id(config["bot_user"]):
+            raise ValueError("Command bot must be a local Matrix user")
+        self.commands = BotCommands(self, config["bot_user"])
         self.since_ts = cutoff(Path(config["cutoff_file"]), self.now())
         # Only module records get this formatter; do not change Synapse's own logging.
         handler = logging.StreamHandler()
@@ -120,6 +129,12 @@ class RetentionModule:
             ("GET", "/internal/policy", self.policy_endpoint),
             ("POST", "/internal/redact", self.redact_endpoint),
             ("POST", "/command", self.command),
+            ("POST", "/bot/invite", self.commands.invite),
+            ("POST", "/bot/info", self.commands.info),
+            ("POST", "/bot/context", self.commands.context),
+            ("POST", "/bot/chat", self.commands.chat),
+            ("POST", "/bot/resolve", self.commands.resolve),
+            ("POST", "/bot/command", self.commands.command),
         ):
             import re
 
@@ -399,26 +414,16 @@ class RetentionModule:
 
     async def command(self, request):
         requester = await self.api.get_user_by_req(request)
-        data = body(request)
-        if data.get("command") != "retention" or data.get("action") not in (
-            "help",
-            "status",
-            "set",
-            "off",
-        ):
-            raise SynapseError(400, "Допустимые действия: help, status, set, off.", "BAD_COMMAND")
-        room = data.get("room_id")
-        if not isinstance(room, str) or not room.startswith("!"):
-            raise SynapseError(400, "Укажите room_id.", "BAD_ROOM_ID")
-        user = requester.user.to_string()
+        return await self.execute_command(requester.user.to_string(), body(request))
+
+    async def authorized_state(self, user, room, *, admin=False):
         state = await self.api.get_room_state(
             room, [("m.room.member", user), ("m.room.power_levels", ""), ("m.room.create", "")]
         )
         member = state.get(("m.room.member", user))
         if not member or member.content.get("membership") != "join":
             raise SynapseError(403, "Команда доступна участнику комнаты.", "NOT_JOINED")
-        action = data["action"]
-        if action in {"set", "off"}:
+        if admin:
             levels = state.get(("m.room.power_levels", ""))
             power = levels.content if levels else {}
             create = state.get(("m.room.create", ""))
@@ -431,12 +436,33 @@ class RetentionModule:
                     level = 100
             if level < self.admin_level:
                 raise SynapseError(403, "Настройку меняет администратор комнаты.", "NOT_ROOM_ADMIN")
+        return state
+
+    async def execute_command(self, user, data, *, trigger=None):
+        if data.get("command") != "retention" or data.get("action") not in (
+            "help",
+            "status",
+            "set",
+            "off",
+        ):
+            raise SynapseError(400, "Допустимые действия: help, status, set, off.", "BAD_COMMAND")
+        room = data.get("room_id")
+        if not isinstance(room, str) or not room.startswith("!"):
+            raise SynapseError(400, "Укажите room_id.", "BAD_ROOM_ID")
+        action = data["action"]
+        await self.authorized_state(user, room, admin=action in {"set", "off"})
+        replay = False
+        if action in {"set", "off"}:
             try:
                 if action == "off":
                     if self.server_policy.default_max is not None:
                         raise ValueError("Серверный срок хранения действует для этой комнаты.")
                     content = {}
                 else:
+                    if trigger and "min_lifetime" not in data:
+                        existing = await self.effective(room)
+                        if existing.min_lifetime is not None:
+                            data = {**data, "min_lifetime": existing.min_lifetime}
                     content = self.server_policy.requested(json.dumps(data))
                     maximum = content["max_lifetime"]
                     if (
@@ -446,26 +472,33 @@ class RetentionModule:
                         raise ValueError("Нужен запас между min_lifetime и max_lifetime.")
             except (KeyError, ValueError) as error:
                 raise SynapseError(400, str(error), "BAD_POLICY") from None
-            await self.api.create_and_send_event_into_room(
-                {
-                    "type": "m.room.retention",
-                    "state_key": "",
-                    "room_id": room,
-                    "sender": user,
-                    "content": content,
-                }
-            )
-            logger.info(
-                "Изменён срок хранения комнаты", extra={"event": "policy.changed", "room_id": room}
-            )
+            replay = trigger and await self.commands.previously_applied(room, user, trigger)
+            if not replay:
+                if trigger:
+                    content["org.retentionbot.command_event_id"] = trigger
+                await self.api.create_and_send_event_into_room(
+                    {
+                        "type": "m.room.retention",
+                        "state_key": "",
+                        "room_id": room,
+                        "sender": user,
+                        "content": content,
+                    }
+                )
+                logger.info(
+                    "Изменён срок хранения комнаты",
+                    extra={"event": "policy.changed", "room_id": room},
+                )
         result = await self.policy_data(room)
         result.update(
             ok=True,
-            message="Настройка сохранена."
+            message="Команда уже выполнена. Показана текущая политика."
+            if replay
+            else "Настройка сохранена."
             if action in {"set", "off"}
             else "Текущая политика хранения.",
             bot_membership_required=False,
-            encrypted_chat_commands=False,
+            encrypted_chat_commands=bool(self.commands.bot_user),
             message_linked_media_cleanup=False,
         )
         if action == "help":

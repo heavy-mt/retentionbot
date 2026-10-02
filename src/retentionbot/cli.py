@@ -43,7 +43,7 @@ async def supervise(coroutine):
 def main():
     parser = argparse.ArgumentParser(description="Server-side Matrix retention service")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("observer", "worker", "status", "health"):
+    for name in ("observer", "worker", "status", "health", "command-bot", "bot-health"):
         sub.add_parser(name)
     cmd = sub.add_parser("command")
     cmd.add_argument("--synapse-url", default=os.getenv("SYNAPSE_URL"))
@@ -54,11 +54,25 @@ def main():
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
     for handler in logging.getLogger().handlers:
         handler.setFormatter(JsonFormatter())
-    for name in ("aio_pika", "aiormq"):
+    for name in ("aio_pika", "aiormq", "nio", "peewee", "aiohttp.client"):
         logging.getLogger(name).setLevel(logging.CRITICAL)
     try:
         if args.command == "command":
             asyncio.run(command(args))
+            return
+        if args.command in {"command-bot", "bot-health"}:
+            from .command_bot import BotConfig, BotStore
+            from .command_bot import run as run_bot
+
+            bot_config = BotConfig.from_env()
+            if args.command == "bot-health":
+                bot_store = BotStore(bot_config.data_dir)
+                try:
+                    last = int(bot_store.get("last_sync") or 0)
+                    raise SystemExit(0 if now_ms() - last < 90_000 else 1)
+                finally:
+                    bot_store.close()
+            asyncio.run(supervise(run_bot(bot_config)))
             return
         config = Config.from_env()
         if args.command in {"status", "health"}:

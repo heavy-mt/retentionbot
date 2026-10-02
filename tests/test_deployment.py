@@ -15,5 +15,14 @@ def test_private_broker_no_matrix_identity_or_crypto_secrets():
     assert not any(service.get("ports") for service in compose["services"].values())
     assert compose["services"]["postgres"]["image"] == "postgres:18.6-bookworm"
     assert "postgres-data:/var/lib/postgresql" in compose["services"]["postgres"]["volumes"]
-    assert set(compose["secrets"]) == {"synapse_module_secret", "postgres_admin_password"}
+    assert set(compose["secrets"]) == {
+        "synapse_module_secret",
+        "postgres_admin_password",
+        "command_bot_access_token",
+    }
+    command_bot = compose["services"]["command-bot"]
+    assert command_bot["networks"] == ["synapse"]
+    assert command_bot["secrets"] == ["command_bot_access_token"]
+    assert "DATABASE_URL" not in command_bot["environment"]
+    assert "SYNAPSE_MODULE_SECRET_FILE" not in command_bot["environment"]
     assert "matrix-nio" not in str(compose)

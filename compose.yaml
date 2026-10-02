@@ -1,6 +1,6 @@
 x-service: &service
   build: .
-  image: retentionbot:0.2.0
+  image: retentionbot:0.3.0
   restart: unless-stopped
   read_only: true
   tmpfs: [/tmp]
@@ -24,6 +24,31 @@ x-service: &service
       condition: service_healthy
 
 services:
+  command-bot:
+    profiles: [commands]
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.command-bot
+    image: retention-command-bot:0.3.0
+    command: [command-bot]
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      SYNAPSE_URL: ${SYNAPSE_URL}
+      COMMAND_BOT_USER_ID: ${COMMAND_BOT_USER_ID:-}
+      COMMAND_BOT_ACCESS_TOKEN_FILE: /run/secrets/command_bot_access_token
+    secrets: [command_bot_access_token]
+    volumes: [command-bot-data:/data]
+    networks: [synapse]
+    healthcheck:
+      test: [CMD, retentionbot, bot-health]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
   observer:
     <<: *service
     command: [observer]
@@ -71,12 +96,15 @@ services:
       retries: 10
 
 secrets:
+  command_bot_access_token:
+    file: ./secrets/command_bot_access_token
   synapse_module_secret:
     file: ./secrets/synapse_module_secret
   postgres_admin_password:
     file: ./secrets/postgres_admin_password
 
 volumes:
+  command-bot-data:
   service-data:
   rabbitmq-data:
   postgres-data:

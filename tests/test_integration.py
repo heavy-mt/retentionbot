@@ -87,6 +87,7 @@ async def homeserver(tmp_path):
                     "secret_file": str(tmp_path / "module-secret"),
                     "cutoff_file": str(tmp_path / "retention-cutoff"),
                     "redaction_lead": 1500,
+                    "command_bot_user_id": "@retention:test.local",
                 },
             }
         ],

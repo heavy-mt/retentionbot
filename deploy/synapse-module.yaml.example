@@ -7,6 +7,8 @@ modules:
       cutoff_file: /data/retention-cutoff
       redaction_lead: 5m
       room_admin_power_level: 100
+      # Optional: dedicated normal user; joins only personal management chats.
+      # command_bot_user_id: "@retention:example.org"
 
 # Keep the existing native retention policy. Example for a new test installation:
 retention:

@@ -4,6 +4,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import tempfile
 from dataclasses import asdict
 from importlib.metadata import version as package_version
@@ -24,6 +25,14 @@ PREFIX = "/_synapse/retention/v1"
 MESSAGE_TYPES = frozenset({"m.room.message", "m.room.encrypted", "m.reaction", "m.sticker"})
 logger = logging.getLogger(__name__)
 _ACTIVE_MODULE = None
+SYNAPSE_MIN_VERSION = (1, 161, 0)
+
+
+def synapse_release_tuple(value: str) -> tuple[int, int, int]:
+    match = re.match(r"^(\\d+)\\.(\\d+)\\.(\\d+)", value)
+    if not match:
+        raise ValueError(f"Unsupported Synapse version string: {value}")
+    return tuple(int(part) for part in match.groups())
 
 
 async def should_force_limited(requester, room_id: str) -> bool:
@@ -84,7 +93,7 @@ def body(request):
 
 
 class RetentionModule:
-    """Read-only event feed + native event creation, tested against exactly Synapse 1.161.0.
+    """Read-only event feed + native event creation for Synapse 1.161.0 and newer.
 
     The sender is a real local author/moderator. No extra room member or crypto device
     is registered. Internal handler calls follow Synapse's administrative redaction path.
@@ -110,8 +119,9 @@ class RetentionModule:
         }
 
     def __init__(self, config, api):
-        if package_version("matrix-synapse") != "1.161.0":
-            raise ValueError("Retention module requires tested Synapse 1.161.0")
+        installed_synapse = package_version("matrix-synapse")
+        if synapse_release_tuple(installed_synapse) < SYNAPSE_MIN_VERSION:
+            raise ValueError("Retention module requires Synapse 1.161.0 or newer")
         self.api, self.hs = api, api._hs
         self.store = self.hs.get_datastores().main
         native = self.hs.config.retention

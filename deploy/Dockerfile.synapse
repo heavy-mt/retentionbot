@@ -1,4 +1,5 @@
-FROM ghcr.io/element-hq/synapse:v1.161.0
+ARG SYNAPSE_VERSION=1.161.0
+FROM ghcr.io/element-hq/synapse:v${SYNAPSE_VERSION}
 
 COPY pyproject.toml /tmp/retention-module/pyproject.toml
 COPY src /tmp/retention-module/src

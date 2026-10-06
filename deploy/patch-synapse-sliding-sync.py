@@ -13,7 +13,13 @@ import synapse.rest.client.sync
 path = Path(synapse.rest.client.sync.__file__)
 text = path.read_text()
 
-import_line = (\n    "from synapse_retention.module import (\\n"\n    "    get_unseen_invalidation_rooms,\\n"\n    "    should_force_limited,\\n"\n    ")\\n"\n)\nimport_marker = "from synapse.types import (\n"
+import_line = (
+    "from synapse_retention.module import (\n"
+    "    get_unseen_invalidation_rooms,\n"
+    "    should_force_limited,\n"
+    ")\n"
+)
+import_marker = "from synapse.types import (\n"
 old = (
     '            if room_result.limited is not None:\n'
     '                serialized_rooms[room_id]["limited"] = room_result.limited\n'

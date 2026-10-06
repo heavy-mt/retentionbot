@@ -486,10 +486,13 @@ class RetentionModule:
             raise SynapseError(400, "Требуются event_id и room_id.", "BAD_INVALIDATION")
 
         # The invalidation must happen only after native retention has physically
-        # removed the target. Otherwise the client's limited reload would simply
-        # fetch the still-present redacted event again.
-        event = await self.store.get_event(event_id, allow_none=True)
-        if event is not None:
+        # removed the target. Query the events table directly: Synapse's event cache can
+        # retain a previously loaded event briefly after the purge transaction.
+        def still_persisted(txn):
+            txn.execute("SELECT 1 FROM events WHERE event_id=?", (event_id,))
+            return txn.fetchone() is not None
+
+        if await self.api.run_db_interaction("retention_invalidation_purge_check", still_persisted):
             return 200, {
                 "status": "deferred",
                 "code": "EVENT_NOT_PURGED",

@@ -15,11 +15,18 @@ text = path.read_text()
 
 import_line = "from synapse_retention.module import should_force_limited\n"
 import_marker = "from synapse.types import (\n"
-old = '                serialized_rooms[room_id]["limited"] = room_result.limited\n'
+old = (
+    '            # This will be omitted for invite/knock rooms with \`stripped_state\`\n'
+    '            if room_result.limited is not None:\n'
+    '                serialized_rooms[room_id]["limited"] = room_result.limited\n'
+)
 new = (
+    '            force_limited = await should_force_limited(requester, room_id)\n'
+    '            # Preserve Synapse omission semantics unless retention invalidation\n'
+    '            # explicitly needs to force a limited timeline for this device.\n'
+    '            if room_result.limited is not None or force_limited:\n'
     '                serialized_rooms[room_id]["limited"] = (\n'
-    '                    room_result.limited\n'
-    '                    or await should_force_limited(requester, room_id)\n'
+    '                    bool(room_result.limited) or force_limited\n'
     '                )\n'
 )
 

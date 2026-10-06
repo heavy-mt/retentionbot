@@ -61,6 +61,15 @@ class Observer:
             except Exception:
                 self.store.queued(event["event_id"], 0)
                 raise
+
+        for invalidation in self.store.due_invalidations(at, self.config.batch_size):
+            self.store.invalidation_queued(invalidation["event_id"], at)
+            try:
+                await self.broker.publish("invalidate", invalidation["event_id"])
+            except Exception:
+                self.store.invalidation_queued(invalidation["event_id"], 0)
+                raise
+
         self.store.compact(at - 7 * 86_400_000, self.config.batch_size)
 
 

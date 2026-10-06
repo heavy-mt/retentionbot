@@ -76,9 +76,36 @@ def test_off_or_invalid_policy_prevents_scheduling(store):
     assert not store.due(900000)
 
 
+def test_invalidation_waits_for_physical_retention_deadline(store):
+    ingest(store, event(ts=200))
+    store.finish("$new", {"status": "done", "redaction_id": "$r"}, 1000)
+    assert not store.due_invalidations(1199)
+    assert [row["event_id"] for row in store.due_invalidations(1200)] == ["$new"]
+
+    store.invalidation_queued("$new", 1200)
+    assert not store.due_invalidations(1201)
+    assert store.due_invalidations(301201)
+
+    store.invalidation_retry("$new", 400000, "EVENT_NOT_PURGED")
+    assert not store.due_invalidations(399999)
+    assert store.due_invalidations(400000)
+
+    store.invalidation_finish("$new", {"generation": 7}, 400001)
+    assert store.invalidation("$new")["status"] == "done"
+    assert store.invalidation("$new")["generation"] == 7
+    assert not store.due_invalidations(500000)
+
+
 def test_archival_keeps_pending_and_missed_jobs(store):
     ingest(store, event("$done"), event("$missed"), event("$pending"))
     store.finish("$done", {"status": "done", "redaction_id": "$r"}, 1000)
     store.finish("$missed", {"status": "missed", "code": "EVENT_PURGED"}, 1000)
+
+    # A completed message must remain until its post-purge invalidation is complete.
     store.compact(2000)
+    assert store.counts() == {"done": 1, "missed": 1, "pending": 1}
+
+    store.invalidation_finish("$done", {"generation": 1}, 2001)
+    store.invalidation_finish("$missed", {"generation": 2}, 2001)
+    store.compact(3000)
     assert store.counts() == {"missed": 1, "pending": 1}

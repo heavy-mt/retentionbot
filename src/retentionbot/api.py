@@ -63,3 +63,10 @@ class ServerApi(JsonApi):
 
     async def redact(self, event_id: str):
         return await self.request("POST", PREFIX + "/internal/redact", json={"event_id": event_id})
+
+    async def invalidate(self, event_id: str, room_id: str):
+        return await self.request(
+            "POST",
+            PREFIX + "/internal/invalidate",
+            json={"event_id": event_id, "room_id": room_id},
+        )

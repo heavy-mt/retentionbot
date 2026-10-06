@@ -14,7 +14,7 @@ from synapse.api.errors import SynapseError
 from synapse.events.py_protocol import supports_msc4242_state_dag
 from synapse.http.server import JsonResource
 from synapse.http.servlet import parse_integer, parse_string
-from synapse.types import UserID, create_requester
+from synapse.types import StreamKeyType, UserID, create_requester
 
 from retentionbot.jsonlog import JsonFormatter
 from retentionbot.policy import ServerPolicy, duration
@@ -33,6 +33,14 @@ def synapse_release_tuple(value: str) -> tuple[int, int, int]:
     if not match:
         raise ValueError(f"Unsupported Synapse version string: {value}")
     return tuple(int(part) for part in match.groups())
+
+
+async def get_unseen_invalidation_rooms(requester, room_ids) -> set[str]:
+    """Return relevant rooms with a purge generation unseen by this Matrix device."""
+    module = _ACTIVE_MODULE
+    if module is None:
+        return set()
+    return await module.get_unseen_invalidation_rooms(requester, room_ids)
 
 
 async def should_force_limited(requester, room_id: str) -> bool:
@@ -556,15 +564,55 @@ class RetentionModule:
                 "Timeline комнаты помечен для повторной синхронизации",
                 extra={"event": "timeline.invalidated", "room_id": room_id, "event_id": event_id},
             )
+            # The retention generation is outside Synapse's normal Matrix streams, so
+            # wake any long-polling Sliding Sync request for members of this room. The
+            # patched handler will then force the unseen room into the response.
+            self.hs.get_notifier().on_new_event(
+                StreamKeyType.ROOM,
+                self.store.get_room_max_token(),
+                rooms=[room_id],
+            )
         return 200, {"status": "done", "generation": generation}
+
+    @staticmethod
+    def _requester_device_id(requester) -> str:
+        if requester.device_id:
+            return requester.device_id
+        token_id = getattr(requester, "access_token_id", None)
+        return f"token:{token_id}" if token_id is not None else "unknown"
+
+    async def get_unseen_invalidation_rooms(self, requester, room_ids) -> set[str]:
+        await self.ensure_invalidation_schema()
+        relevant = set(room_ids)
+        if not relevant:
+            return set()
+        user_id = requester.user.to_string()
+        device_id = self._requester_device_id(requester)
+
+        def select(txn):
+            txn.execute(
+                """
+                SELECT r.room_id
+                FROM retentionbot_room_invalidations AS r
+                LEFT JOIN retentionbot_client_invalidations AS c
+                  ON c.room_id=r.room_id
+                 AND c.user_id=?
+                 AND c.device_id=?
+                WHERE c.generation IS NULL OR c.generation < r.generation
+                """,
+                (user_id, device_id),
+            )
+            return [row[0] for row in txn.fetchall()]
+
+        unseen = await self.api.run_db_interaction(
+            "retention_invalidation_unseen_rooms", select
+        )
+        return {room_id for room_id in unseen if room_id in relevant}
 
     async def should_force_limited(self, requester, room_id: str) -> bool:
         await self.ensure_invalidation_schema()
         user_id = requester.user.to_string()
-        device_id = requester.device_id
-        if not device_id:
-            token_id = getattr(requester, "access_token_id", None)
-            device_id = f"token:{token_id}" if token_id is not None else "unknown"
+        device_id = self._requester_device_id(requester)
         now = self.now()
         grace_ms = 300_000
 

@@ -5,3 +5,6 @@
 !src/retentionbot/*.py
 !src/synapse_retention/
 !src/synapse_retention/*.py
+
+!deploy/
+!deploy/patch-synapse-sliding-sync.py

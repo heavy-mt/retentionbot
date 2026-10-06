@@ -31,6 +31,19 @@ class Store:
                 ON events(room_id,anchor_ts,event_id) WHERE status='pending';
             CREATE INDEX IF NOT EXISTS completed_metadata
                 ON events(completed_at) WHERE status<>'pending';
+            CREATE TABLE IF NOT EXISTS invalidations(
+                event_id TEXT PRIMARY KEY REFERENCES events(event_id) ON DELETE CASCADE,
+                room_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                queued_at BIGINT NOT NULL DEFAULT 0,
+                next_try BIGINT NOT NULL DEFAULT 0,
+                attempts BIGINT NOT NULL DEFAULT 0,
+                error TEXT,
+                generation BIGINT,
+                completed_at BIGINT
+            );
+            CREATE INDEX IF NOT EXISTS pending_invalidation
+                ON invalidations(next_try,event_id) WHERE status='pending';
         """)
         self.db.initialized(namespace)
 
@@ -150,6 +163,61 @@ class Store:
                 "queued_at=0 WHERE event_id=? AND status='pending'",
                 (result["status"], result.get("code"), result.get("redaction_id"), at, event_id),
             )
+            if result["status"] in {"done", "missed"}:
+                event = self.event(event_id)
+                if event:
+                    self.db.execute(
+                        "INSERT INTO invalidations(event_id,room_id) VALUES(?,?) "
+                        "ON CONFLICT(event_id) DO NOTHING",
+                        (event_id, event["room_id"]),
+                    )
+
+
+    def due_invalidations(self, at: int, limit: int = 1000):
+        return self.db.execute(
+            """
+            SELECT i.* FROM invalidations i
+            JOIN events e ON e.event_id=i.event_id
+            JOIN rooms r ON r.room_id=e.room_id
+            WHERE i.status='pending'
+              AND r.max_lifetime IS NOT NULL
+              AND e.ts<=? - r.max_lifetime
+              AND i.next_try<=?
+              AND (i.queued_at=0 OR i.queued_at<=?)
+            ORDER BY e.ts,i.event_id
+            LIMIT ?
+            """,
+            (at, at, at - 300_000, limit),
+        ).fetchall()
+
+    def invalidation(self, event_id: str):
+        return self.db.execute(
+            "SELECT * FROM invalidations WHERE event_id=?", (event_id,)
+        ).fetchone()
+
+    def invalidation_queued(self, event_id: str, at: int):
+        with self.db:
+            self.db.execute(
+                "UPDATE invalidations SET queued_at=? "
+                "WHERE event_id=? AND status='pending'",
+                (at, event_id),
+            )
+
+    def invalidation_retry(self, event_id: str, at: int, code: str):
+        with self.db:
+            self.db.execute(
+                "UPDATE invalidations SET next_try=?,error=?,attempts=attempts+1,queued_at=0 "
+                "WHERE event_id=? AND status='pending'",
+                (at, code, event_id),
+            )
+
+    def invalidation_finish(self, event_id: str, result: dict, at: int):
+        with self.db:
+            self.db.execute(
+                "UPDATE invalidations SET status='done',error=?,generation=?,completed_at=?,"
+                "queued_at=0 WHERE event_id=? AND status='pending'",
+                (result.get("code"), result.get("generation"), at, event_id),
+            )
 
     def counts(self):
         return {
@@ -160,7 +228,10 @@ class Store:
     def compact(self, before: int, limit: int = 1000):
         with self.db:
             self.db.execute(
-                "DELETE FROM events WHERE event_id IN (SELECT event_id FROM events "
-                "WHERE status='done' AND completed_at<? ORDER BY completed_at LIMIT ?)",
+                "DELETE FROM events WHERE event_id IN (SELECT e.event_id FROM events e "
+                "WHERE e.status='done' AND e.completed_at<? "
+                "AND NOT EXISTS (SELECT 1 FROM invalidations i "
+                "WHERE i.event_id=e.event_id AND i.status='pending') "
+                "ORDER BY e.completed_at LIMIT ?)",
                 (before, limit),
             )

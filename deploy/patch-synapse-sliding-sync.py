@@ -1,75 +1,60 @@
 #!/usr/local/bin/python
 """Patch Synapse Sliding Sync for retention invalidation.
 
-The retention module records room purge generations. A room with an unseen
-generation must be forced into the Sliding Sync response and serialized with
-limited=true so matrix-rust-sdk rebuilds its linked chunk after native retention
-has physically purged events.
+Retention generations are consumed only for explicit room subscriptions. Rooms
+that merely appear in a Sliding Sync list (including background/list sync) must
+not consume an invalidation, otherwise Element X can keep stale persistent
+timeline chunks and never receive a reset when the room is opened later.
 """
 
 from pathlib import Path
 
 import synapse.handlers.sliding_sync
-import synapse.rest.client.sync
 
-rest_path = Path(synapse.rest.client.sync.__file__)
 handler_path = Path(synapse.handlers.sliding_sync.__file__)
-
-rest_text = rest_path.read_text()
 handler_text = handler_path.read_text()
 
-# 1. Serializer hook: force limited=true for an unseen retention generation.
-rest_import = "from synapse_retention.module import should_force_limited\n"
-rest_import_marker = "from synapse.types import (\n"
-rest_old = (
-    '            if room_result.limited is not None:\n'
-    '                serialized_rooms[room_id]["limited"] = room_result.limited\n'
+handler_import = (
+    "from synapse_retention.module import (\n"
+    "    get_unseen_invalidation_rooms,\n"
+    "    should_force_limited,\n"
+    ")\n"
 )
-rest_new = (
-    '            force_limited = (\n'
-    '                room_result.prev_batch is not None\n'
-    '                and await should_force_limited(requester, room_id)\n'
-    '            )\n'
-    '            # Preserve Synapse omission semantics unless retention invalidation\n'
-    '            # explicitly needs to force a limited timeline for this device.\n'
-    '            if room_result.limited is not None or force_limited:\n'
-    '                serialized_rooms[room_id]["limited"] = (\n'
-    '                    bool(room_result.limited) or force_limited\n'
-    '                )\n'
-)
-
-if rest_import not in rest_text:
-    if rest_import_marker not in rest_text:
-        raise SystemExit(f"Synapse REST import marker not found in {rest_path}")
-    rest_text = rest_text.replace(rest_import_marker, rest_import + rest_import_marker, 1)
-
-if rest_new not in rest_text:
-    if rest_old not in rest_text:
-        raise SystemExit(f"Synapse limited serializer marker not found in {rest_path}")
-    rest_text = rest_text.replace(rest_old, rest_new, 1)
-
-# 2. Handler hook: an unseen generation makes an otherwise-clean room dirty for
-# this device, so get_room_sync_data() runs even without a Matrix stream event.
-handler_import = "from synapse_retention.module import get_unseen_invalidation_rooms\n"
 handler_import_marker = "from synapse.api.constants import "
+
 handler_old = (
     "        relevant_rooms_to_send_map = interested_rooms.relevant_rooms_to_send_map\n"
 )
 handler_new = (
     "        relevant_rooms_to_send_map = dict(interested_rooms.relevant_rooms_to_send_map)\n"
+    "        retention_subscription_rooms = set(\n"
+    "            (sync_config.room_subscriptions or {}).keys()\n"
+    "        )\n"
     "        force_retention_rooms = await get_unseen_invalidation_rooms(\n"
-    "            sync_config.requester, relevant_room_map.keys()\n"
+    "            sync_config.requester, retention_subscription_rooms\n"
     "        )\n"
     "        for room_id in force_retention_rooms:\n"
-    "            room_sync_config = relevant_room_map[room_id]\n"
-    "            if room_sync_config.timeline_limit > 0:\n"
+    "            room_sync_config = relevant_room_map.get(room_id)\n"
+    "            if room_sync_config is not None and room_sync_config.timeline_limit > 0:\n"
     "                relevant_rooms_to_send_map[room_id] = room_sync_config\n"
 )
-filter_old = (
+
+room_result_old = (
+    "            # Filter out empty room results during incremental sync\n"
     "            if room_sync_result or not from_token:\n"
     "                rooms[room_id] = room_sync_result\n"
 )
-filter_new = (
+room_result_new = (
+    "            # Retention invalidation is consumed only by an explicit room\n"
+    "            # subscription with a real timeline boundary. A list/background\n"
+    "            # sync must leave the generation unseen for the later room open.\n"
+    "            if room_id in force_retention_rooms and room_sync_result.prev_batch is not None:\n"
+    "                if await should_force_limited(sync_config.requester, room_id):\n"
+    "                    room_sync_result = attr.evolve(room_sync_result, limited=True)\n"
+    "\n"
+    "            # Filter out empty room results during incremental sync. Forced\n"
+    "            # retention rooms must still be serialized so limited=true reaches\n"
+    "            # matrix-rust-sdk and rebuilds its persistent linked chunk.\n"
     "            if room_sync_result or not from_token or room_id in force_retention_rooms:\n"
     "                rooms[room_id] = room_sync_result\n"
 )
@@ -86,12 +71,10 @@ if handler_new not in handler_text:
         raise SystemExit(f"Synapse relevant-room marker not found in {handler_path}")
     handler_text = handler_text.replace(handler_old, handler_new, 1)
 
-if filter_new not in handler_text:
-    if filter_old not in handler_text:
-        raise SystemExit(f"Synapse room-result filter marker not found in {handler_path}")
-    handler_text = handler_text.replace(filter_old, filter_new, 1)
+if room_result_new not in handler_text:
+    if room_result_old not in handler_text:
+        raise SystemExit(f"Synapse room-result marker not found in {handler_path}")
+    handler_text = handler_text.replace(room_result_old, room_result_new, 1)
 
-rest_path.write_text(rest_text)
 handler_path.write_text(handler_text)
-print(f"patched {rest_path}")
 print(f"patched {handler_path}")

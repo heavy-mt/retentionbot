@@ -23,6 +23,20 @@ from .commands import BotCommands
 PREFIX = "/_synapse/retention/v1"
 MESSAGE_TYPES = frozenset({"m.room.message", "m.room.encrypted", "m.reaction", "m.sticker"})
 logger = logging.getLogger(__name__)
+_ACTIVE_MODULE = None
+
+
+async def should_force_limited(requester, room_id: str) -> bool:
+    """Return whether Sliding Sync should force a limited room timeline.
+
+    A purge generation is consumed per Matrix device for a bounded grace window.
+    This lets matrix-rust-sdk rebuild its linked chunk after server-side retention
+    removed history, without keeping every retention room permanently limited.
+    """
+    module = _ACTIVE_MODULE
+    if module is None:
+        return False
+    return await module.should_force_limited(requester, room_id)
 
 
 def cutoff(path: Path, now: int) -> int:
@@ -116,6 +130,9 @@ class RetentionModule:
         if config["bot_user"] and not self.hs.is_mine_id(config["bot_user"]):
             raise ValueError("Command bot must be a local Matrix user")
         self.commands = BotCommands(self, config["bot_user"])
+        self._invalidation_schema_ready = False
+        global _ACTIVE_MODULE
+        _ACTIVE_MODULE = self
         self.since_ts = cutoff(Path(config["cutoff_file"]), self.now())
         # Only module records get this formatter; do not change Synapse's own logging.
         handler = logging.StreamHandler()
@@ -128,6 +145,7 @@ class RetentionModule:
             ("GET", "/internal/feed", self.feed),
             ("GET", "/internal/policy", self.policy_endpoint),
             ("POST", "/internal/redact", self.redact_endpoint),
+            ("POST", "/internal/invalidate", self.invalidate_endpoint),
             ("POST", "/command", self.command),
             ("POST", "/bot/invite", self.commands.invite),
             ("POST", "/bot/info", self.commands.info),
@@ -411,6 +429,167 @@ class RetentionModule:
             extra={"event": "message.redacted", "room_id": event.room_id, "event_id": event_id},
         )
         return 200, {"status": "done", "redaction_id": redaction.event_id, "sender": sender}
+
+
+    async def ensure_invalidation_schema(self):
+        if self._invalidation_schema_ready:
+            return
+
+        def create(txn):
+            txn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS retentionbot_room_invalidations(
+                    room_id TEXT PRIMARY KEY,
+                    generation BIGINT NOT NULL,
+                    updated_ts BIGINT NOT NULL
+                )
+                """
+            )
+            txn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS retentionbot_event_invalidations(
+                    event_id TEXT PRIMARY KEY,
+                    room_id TEXT NOT NULL,
+                    generation BIGINT NOT NULL
+                )
+                """
+            )
+            txn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS retentionbot_client_invalidations(
+                    user_id TEXT NOT NULL,
+                    device_id TEXT NOT NULL,
+                    room_id TEXT NOT NULL,
+                    generation BIGINT NOT NULL,
+                    force_until BIGINT NOT NULL,
+                    PRIMARY KEY(user_id, device_id, room_id)
+                )
+                """
+            )
+
+        await self.api.run_db_interaction("retention_invalidation_schema", create)
+        self._invalidation_schema_ready = True
+
+    async def invalidate_endpoint(self, request):
+        self.authenticate(request)
+        data = body(request)
+        event_id = data.get("event_id")
+        room_id = data.get("room_id")
+        if (
+            not isinstance(event_id, str)
+            or not event_id.startswith("$")
+            or len(event_id) > 1024
+            or not isinstance(room_id, str)
+            or not room_id.startswith("!")
+            or len(room_id) > 1024
+        ):
+            raise SynapseError(400, "Требуются event_id и room_id.", "BAD_INVALIDATION")
+
+        # The invalidation must happen only after native retention has physically
+        # removed the target. Otherwise the client's limited reload would simply
+        # fetch the still-present redacted event again.
+        event = await self.store.get_event(event_id, allow_none=True)
+        if event is not None:
+            return 200, {
+                "status": "deferred",
+                "code": "EVENT_NOT_PURGED",
+                "retry_at_ms": self.now() + 10_000,
+            }
+
+        await self.ensure_invalidation_schema()
+
+        def bump(txn):
+            txn.execute(
+                "SELECT room_id,generation FROM retentionbot_event_invalidations "
+                "WHERE event_id=?",
+                (event_id,),
+            )
+            previous = txn.fetchone()
+            if previous:
+                if previous[0] != room_id:
+                    raise ValueError("Invalidation room mismatch")
+                return previous[1], False
+
+            txn.execute(
+                "SELECT generation FROM retentionbot_room_invalidations WHERE room_id=?",
+                (room_id,),
+            )
+            row = txn.fetchone()
+            generation = (row[0] if row else 0) + 1
+            if row:
+                txn.execute(
+                    "UPDATE retentionbot_room_invalidations "
+                    "SET generation=?,updated_ts=? WHERE room_id=?",
+                    (generation, self.now(), room_id),
+                )
+            else:
+                txn.execute(
+                    "INSERT INTO retentionbot_room_invalidations(room_id,generation,updated_ts) "
+                    "VALUES(?,?,?)",
+                    (room_id, generation, self.now()),
+                )
+            txn.execute(
+                "INSERT INTO retentionbot_event_invalidations(event_id,room_id,generation) "
+                "VALUES(?,?,?)",
+                (event_id, room_id, generation),
+            )
+            return generation, True
+
+        generation, created = await self.api.run_db_interaction(
+            "retention_invalidation_bump", bump
+        )
+        if created:
+            logger.info(
+                "Timeline комнаты помечен для повторной синхронизации",
+                extra={"event": "timeline.invalidated", "room_id": room_id, "event_id": event_id},
+            )
+        return 200, {"status": "done", "generation": generation}
+
+    async def should_force_limited(self, requester, room_id: str) -> bool:
+        await self.ensure_invalidation_schema()
+        user_id = requester.user.to_string()
+        device_id = requester.device_id
+        if not device_id:
+            token_id = getattr(requester, "access_token_id", None)
+            device_id = f"token:{token_id}" if token_id is not None else "unknown"
+        now = self.now()
+        grace_ms = 300_000
+
+        def consume(txn):
+            txn.execute(
+                "SELECT generation FROM retentionbot_room_invalidations WHERE room_id=?",
+                (room_id,),
+            )
+            room = txn.fetchone()
+            if not room:
+                return False
+            generation = room[0]
+            txn.execute(
+                "SELECT generation,force_until FROM retentionbot_client_invalidations "
+                "WHERE user_id=? AND device_id=? AND room_id=?",
+                (user_id, device_id, room_id),
+            )
+            seen = txn.fetchone()
+            if not seen or seen[0] < generation:
+                force_until = now + grace_ms
+                if seen:
+                    txn.execute(
+                        "UPDATE retentionbot_client_invalidations "
+                        "SET generation=?,force_until=? "
+                        "WHERE user_id=? AND device_id=? AND room_id=?",
+                        (generation, force_until, user_id, device_id, room_id),
+                    )
+                else:
+                    txn.execute(
+                        "INSERT INTO retentionbot_client_invalidations"
+                        "(user_id,device_id,room_id,generation,force_until) "
+                        "VALUES(?,?,?,?,?)",
+                        (user_id, device_id, room_id, generation, force_until),
+                    )
+                return True
+            return seen[1] > now
+
+        return await self.api.run_db_interaction("retention_invalidation_consume", consume)
 
     async def command(self, request):
         requester = await self.api.get_user_by_req(request)

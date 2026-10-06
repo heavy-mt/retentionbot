@@ -29,7 +29,7 @@ SYNAPSE_MIN_VERSION = (1, 161, 0)
 
 
 def synapse_release_tuple(value: str) -> tuple[int, int, int]:
-    match = re.match(r"^(\\d+)\\.(\\d+)\\.(\\d+)", value)
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", value)
     if not match:
         raise ValueError(f"Unsupported Synapse version string: {value}")
     return tuple(int(part) for part in match.groups())

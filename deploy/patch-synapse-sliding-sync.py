@@ -26,7 +26,10 @@ rest_old = (
     '                serialized_rooms[room_id]["limited"] = room_result.limited\n'
 )
 rest_new = (
-    '            force_limited = await should_force_limited(requester, room_id)\n'
+    '            force_limited = (\n'
+    '                room_result.prev_batch is not None\n'
+    '                and await should_force_limited(requester, room_id)\n'
+    '            )\n'
     '            # Preserve Synapse omission semantics unless retention invalidation\n'
     '            # explicitly needs to force a limited timeline for this device.\n'
     '            if room_result.limited is not None or force_limited:\n'
@@ -58,7 +61,9 @@ handler_new = (
     "            sync_config.requester, relevant_room_map.keys()\n"
     "        )\n"
     "        for room_id in force_retention_rooms:\n"
-    "            relevant_rooms_to_send_map[room_id] = relevant_room_map[room_id]\n"
+    "            room_sync_config = relevant_room_map[room_id]\n"
+    "            if room_sync_config.timeline_limit > 0:\n"
+    "                relevant_rooms_to_send_map[room_id] = room_sync_config\n"
 )
 filter_old = (
     "            if room_sync_result or not from_token:\n"

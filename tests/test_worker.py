@@ -47,3 +47,30 @@ async def test_transient_api_error_keeps_retryable_job(store):
     await Worker(store, api).handle("$new")
     assert store.event("$new")["status"] == "pending"
     assert store.event("$new")["attempts"] == 1
+
+
+async def test_post_purge_invalidation_retries_until_synapse_confirms(store):
+    ingest(store, event(ts=200))
+    store.finish("$new", {"status": "done", "redaction_id": "$redaction"}, 1000)
+
+    api = AsyncMock()
+    api.invalidate.side_effect = [
+        {
+            "status": "deferred",
+            "code": "EVENT_NOT_PURGED",
+            "retry_at_ms": 9999999999999,
+        },
+        {"status": "done", "generation": 3},
+    ]
+    worker = Worker(store, api)
+
+    await worker.handle_invalidation("$new")
+    pending = store.invalidation("$new")
+    assert pending["status"] == "pending"
+    assert pending["error"] == "EVENT_NOT_PURGED"
+
+    await worker.handle_invalidation("$new")
+    done = store.invalidation("$new")
+    assert done["status"] == "done"
+    assert done["generation"] == 3
+    assert api.invalidate.await_count == 2

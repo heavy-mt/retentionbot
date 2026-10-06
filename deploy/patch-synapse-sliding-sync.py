@@ -16,7 +16,6 @@ text = path.read_text()
 import_line = "from synapse_retention.module import should_force_limited\n"
 import_marker = "from synapse.types import (\n"
 old = (
-    '            # This will be omitted for invite/knock rooms with \`stripped_state\`\n'
     '            if room_result.limited is not None:\n'
     '                serialized_rooms[room_id]["limited"] = room_result.limited\n'
 )

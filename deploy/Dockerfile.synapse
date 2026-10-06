@@ -10,4 +10,5 @@ RUN /usr/local/bin/python -m pip install --no-cache-dir --no-deps /tmp/retention
     && /usr/local/bin/python /tmp/retention-module/patch-synapse-sliding-sync.py \
     && /usr/local/bin/python -m py_compile \
        "$(/usr/local/bin/python -c 'import synapse.rest.client.sync; print(synapse.rest.client.sync.__file__)')" \
+       "$(/usr/local/bin/python -c 'import synapse.handlers.sliding_sync; print(synapse.handlers.sliding_sync.__file__)')" \
     && rm -rf /tmp/retention-module

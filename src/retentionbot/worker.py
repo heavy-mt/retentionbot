@@ -53,6 +53,41 @@ class Worker:
                 extra={"event": "job.retry", "event_id": event_id, "code": code},
             )
 
+    async def handle_invalidation(self, event_id: str):
+        job = self.store.invalidation(event_id)
+        event = self.store.event(event_id)
+        if not job or job["status"] != "pending" or not event:
+            return
+        try:
+            result = await self.api.invalidate(event_id, event["room_id"])
+            if result.get("status") == "deferred":
+                at = max(now_ms() + 1000, result["retry_at_ms"])
+                self.store.invalidation_retry(
+                    event_id, at, result.get("code", "EVENT_NOT_PURGED")
+                )
+                return
+            if result.get("status") != "done" or not isinstance(result.get("generation"), int):
+                raise ApiError(502, "INVALIDATION_UNCONFIRMED")
+            self.store.invalidation_finish(event_id, result, now_ms())
+            logger.info(
+                "Timeline комнаты помечен для повторной синхронизации",
+                extra={
+                    "event": "timeline.invalidated",
+                    "event_id": event_id,
+                    "room_id": event["room_id"],
+                    "generation": result["generation"],
+                },
+            )
+        except (TimeoutError, ApiError, aiohttp.ClientError) as error:
+            code = error.code if isinstance(error, ApiError) else type(error).__name__
+            delay = min(300_000, 1000 * 2 ** min(job["attempts"], 8))
+            delay = max(delay, getattr(error, "retry_ms", 0))
+            self.store.invalidation_retry(event_id, now_ms() + delay, code)
+            logger.warning(
+                "Инвалидация timeline будет повторена",
+                extra={"event": "invalidation.retry", "event_id": event_id, "code": code},
+            )
+
 
 async def run(config: Config):
     store = Store(config.database_url or config.data_dir / "server.db")
@@ -67,7 +102,7 @@ async def run(config: Config):
                         if (
                             not isinstance(job, dict)
                             or job.get("v") != 1
-                            or job.get("kind") != "redact"
+                            or job.get("kind") not in {"redact", "invalidate"}
                             or not isinstance(job.get("key"), str)
                             or not job["key"].startswith("$")
                         ):
@@ -76,7 +111,10 @@ async def run(config: Config):
                         await message.reject(requeue=False)
                         continue
                     try:
-                        await worker.handle(job["key"])
+                        if job["kind"] == "redact":
+                            await worker.handle(job["key"])
+                        else:
+                            await worker.handle_invalidation(job["key"])
                     except (psycopg.OperationalError, psycopg.InterfaceError):
                         await message.nack(requeue=True)
                         raise

@@ -530,14 +530,6 @@ class RetentionModule:
             )
             txn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS retentionbot_cache_reset_events(
-                    event_id TEXT PRIMARY KEY,
-                    room_id TEXT NOT NULL
-                )
-                """
-            )
-            txn.execute(
-                """
                 CREATE TABLE IF NOT EXISTS retentionbot_cache_reset_rooms(
                     room_id TEXT PRIMARY KEY,
                     generation BIGINT NOT NULL,
@@ -561,37 +553,28 @@ class RetentionModule:
         await self.api.run_db_interaction("retention_invalidation_schema", create)
         self._invalidation_schema_ready = True
 
-    async def queue_cache_reset(self, event_id: str, room_id: str) -> bool:
+    async def queue_cache_reset(self, room_id: str, generation: int) -> bool:
         """Queue one debounced Element X EventCache reset for this room.
 
-        Event invalidations are frequent, so the request path only dirties one room
-        row. The background task expands due rooms to affected local users once per
-        debounce window, then performs at most one account-data pulse per user.
+        The room invalidation generation is the durable idempotency key. If Synapse
+        crashes after bumping the invalidation but before queuing the client reset, a
+        retry with the same generation still repairs the missing queue entry.
         """
         if not self.cache_reset_enabled:
             return False
         await self.ensure_invalidation_schema()
         due = self.now() + self.cache_reset_debounce_ms
 
-        def queue(txn):
-            txn.execute(
-                "SELECT room_id FROM retentionbot_cache_reset_events WHERE event_id=?",
-                (event_id,),
-            )
-            previous = txn.fetchone()
-            if previous:
-                if previous[0] != room_id:
-                    raise ValueError("Cache-reset room mismatch")
-                return False
-
+        def queue_room(txn):
             txn.execute(
                 "SELECT generation,expanded_generation,due_ts "
                 "FROM retentionbot_cache_reset_rooms WHERE room_id=?",
                 (room_id,),
             )
             row = txn.fetchone()
+            if row and generation <= row[0]:
+                return False
             if row:
-                generation = row[0] + 1
                 pending = row[0] > row[1]
                 due_ts = row[2] if pending and row[2] > 0 else due
                 txn.execute(
@@ -603,16 +586,13 @@ class RetentionModule:
                 txn.execute(
                     "INSERT INTO retentionbot_cache_reset_rooms"
                     "(room_id,generation,expanded_generation,due_ts) VALUES(?,?,?,?)",
-                    (room_id, 1, 0, due),
+                    (room_id, generation, 0, due),
                 )
-
-            txn.execute(
-                "INSERT INTO retentionbot_cache_reset_events(event_id,room_id) VALUES(?,?)",
-                (event_id, room_id),
-            )
             return True
 
-        return await self.api.run_db_interaction("retention_cache_reset_queue", queue)
+        return await self.api.run_db_interaction(
+            "retention_cache_reset_queue_room", queue_room
+        )
 
     async def _pulse_cache_reset(self, user_id: str) -> None:
         content = await self.api.account_data_manager.get_global(user_id, IGNORED_USER_LIST)
@@ -883,7 +863,7 @@ class RetentionModule:
                 rooms=[room_id],
             )
 
-        cache_reset_queued = await self.queue_cache_reset(event_id, room_id)
+        cache_reset_queued = await self.queue_cache_reset(room_id, generation)
         return 200, {
             "status": "done",
             "generation": generation,

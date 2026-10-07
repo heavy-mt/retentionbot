@@ -16,7 +16,10 @@ from synapse.http.server import JsonResource
 from synapse.http.servlet import parse_integer, parse_string
 from synapse.types import StreamKeyType, UserID, create_requester
 
-from retentionbot.cache_reset import toggle_ignored_user_sentinel
+from retentionbot.cache_reset import (
+    cache_reset_sentinel,
+    set_ignored_user_reset_sentinel,
+)
 from retentionbot.jsonlog import JsonFormatter
 from retentionbot.policy import ServerPolicy, duration
 
@@ -133,7 +136,12 @@ class RetentionModule:
                 raise ValueError(
                     "element_x_cache_reset.sentinel_user_id is required when enabled"
                 )
-            UserID.from_string(cache_reset_sentinel)
+            parsed_sentinel = UserID.from_string(cache_reset_sentinel)
+            if parsed_sentinel.localpart != "__retention_cache_reset":
+                raise ValueError(
+                    "element_x_cache_reset.sentinel_user_id localpart must be "
+                    "__retention_cache_reset"
+                )
         cache_reset_debounce_ms = duration(cache_reset.get("debounce", "10s"))
         cache_reset_min_interval_ms = duration(cache_reset.get("min_interval", "5m"))
         cache_reset_poll_ms = duration(cache_reset.get("poll_interval", "2s"))
@@ -594,9 +602,20 @@ class RetentionModule:
             "retention_cache_reset_queue_room", queue_room
         )
 
-    async def _pulse_cache_reset(self, user_id: str) -> None:
+    async def _pulse_cache_reset(self, user_id: str, generation: int) -> None:
+        sentinel = cache_reset_sentinel(self.cache_reset_sentinel, generation)
+        for reserved_user_id in (self.cache_reset_sentinel, sentinel):
+            if await self.api.get_userinfo_by_id(reserved_user_id) is not None:
+                raise ValueError(
+                    f"Cache-reset sentinel is registered: {reserved_user_id}"
+                )
+
         content = await self.api.account_data_manager.get_global(user_id, IGNORED_USER_LIST)
-        updated = toggle_ignored_user_sentinel(content, self.cache_reset_sentinel)
+        updated = set_ignored_user_reset_sentinel(
+            content,
+            self.cache_reset_sentinel,
+            generation,
+        )
         await self.api.account_data_manager.put_global(user_id, IGNORED_USER_LIST, updated)
 
     async def _expand_due_cache_reset_rooms(self, now: int) -> int:
@@ -664,18 +683,6 @@ class RetentionModule:
             return
         await self.ensure_invalidation_schema()
 
-        # A registered sentinel would turn the workaround into a real ignore rule.
-        # Fail closed and leave dirty generations queued until configuration is fixed.
-        if await self.api.get_userinfo_by_id(self.cache_reset_sentinel) is not None:
-            logger.error(
-                "Cache-reset sentinel зарегистрирован; workaround остановлен",
-                extra={
-                    "event": "client_cache.sentinel_registered",
-                    "user_id": self.cache_reset_sentinel,
-                },
-            )
-            return
-
         # Only Synapse's designated background-task process drains this shared queue.
         # Keep the distributed lock as a second guard for topology/config changes.
         async with self.hs.get_worker_locks_handler().acquire_lock(
@@ -714,7 +721,7 @@ class RetentionModule:
                     continue
                 target_generation = row[0]
                 try:
-                    await self._pulse_cache_reset(user_id)
+                    await self._pulse_cache_reset(user_id, target_generation)
                 except Exception:
                     retry_at = self.now() + 60_000
 

@@ -135,9 +135,12 @@ class RetentionModule:
                 )
             UserID.from_string(cache_reset_sentinel)
         cache_reset_debounce_ms = duration(cache_reset.get("debounce", "10s"))
+        cache_reset_min_interval_ms = duration(cache_reset.get("min_interval", "5m"))
         cache_reset_poll_ms = duration(cache_reset.get("poll_interval", "2s"))
         if not 100 <= cache_reset_debounce_ms <= 300_000:
             raise ValueError("element_x_cache_reset.debounce must be between 100ms and 5m")
+        if not 100 <= cache_reset_min_interval_ms <= 3_600_000:
+            raise ValueError("element_x_cache_reset.min_interval must be between 100ms and 1h")
         if not 100 <= cache_reset_poll_ms <= 60_000:
             raise ValueError("element_x_cache_reset.poll_interval must be between 100ms and 1m")
 
@@ -150,6 +153,7 @@ class RetentionModule:
             "cache_reset_enabled": cache_reset_enabled,
             "cache_reset_sentinel": cache_reset_sentinel,
             "cache_reset_debounce_ms": cache_reset_debounce_ms,
+            "cache_reset_min_interval_ms": cache_reset_min_interval_ms,
             "cache_reset_poll_ms": cache_reset_poll_ms,
         }
 
@@ -177,6 +181,7 @@ class RetentionModule:
         self.cache_reset_enabled = config["cache_reset_enabled"]
         self.cache_reset_sentinel = config["cache_reset_sentinel"]
         self.cache_reset_debounce_ms = config["cache_reset_debounce_ms"]
+        self.cache_reset_min_interval_ms = config["cache_reset_min_interval_ms"]
         self.cache_reset_poll_ms = config["cache_reset_poll_ms"]
         if self.cache_reset_enabled and not self.hs.is_mine_id(self.cache_reset_sentinel):
             raise ValueError("Element X cache-reset sentinel must be a local Matrix user ID")
@@ -634,7 +639,7 @@ class RetentionModule:
                 users = sorted({row[0] for row in txn.fetchall() if row[0] != sentinel})
                 for user_id in users:
                     txn.execute(
-                        "SELECT generation,reset_generation,due_ts "
+                        "SELECT generation,reset_generation,due_ts,last_reset_ts "
                         "FROM retentionbot_cache_reset_users WHERE user_id=?",
                         (user_id,),
                     )
@@ -642,7 +647,11 @@ class RetentionModule:
                     if row:
                         generation = row[0] + 1
                         pending = row[0] > row[1]
-                        due_ts = row[2] if pending and row[2] > 0 else now
+                        due_ts = (
+                            row[2]
+                            if pending and row[2] > 0
+                            else max(now, row[3] + self.cache_reset_min_interval_ms)
+                        )
                         txn.execute(
                             "UPDATE retentionbot_cache_reset_users "
                             "SET generation=?,due_ts=? WHERE user_id=?",

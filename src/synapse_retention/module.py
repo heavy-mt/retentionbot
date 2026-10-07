@@ -641,11 +641,11 @@ class RetentionModule:
             for user_id in users:
                 now = self.now()
 
-                def current(txn):
+                def current(txn, target_user_id=user_id):
                     txn.execute(
                         "SELECT generation,reset_generation,due_ts "
                         "FROM retentionbot_cache_reset_users WHERE user_id=?",
-                        (user_id,),
+                        (target_user_id,),
                     )
                     return txn.fetchone()
 
@@ -660,11 +660,15 @@ class RetentionModule:
                 except Exception:
                     retry_at = self.now() + 60_000
 
-                    def postpone(txn):
+                    def postpone(
+                        txn,
+                        target_user_id=user_id,
+                        target_retry_at=retry_at,
+                    ):
                         txn.execute(
                             "UPDATE retentionbot_cache_reset_users SET due_ts=? "
                             "WHERE user_id=? AND generation>reset_generation",
-                            (retry_at, user_id),
+                            (target_retry_at, target_user_id),
                         )
 
                     await self.api.run_db_interaction(
@@ -678,26 +682,31 @@ class RetentionModule:
 
                 completed = self.now()
 
-                def acknowledge(txn):
+                def acknowledge(
+                    txn,
+                    target_user_id=user_id,
+                    acknowledged_generation=target_generation,
+                    completed_ts=completed,
+                ):
                     txn.execute(
                         "SELECT generation,reset_generation "
                         "FROM retentionbot_cache_reset_users WHERE user_id=?",
-                        (user_id,),
+                        (target_user_id,),
                     )
                     latest = txn.fetchone()
                     if not latest:
                         return
                     generation, reset_generation = latest
-                    reset_generation = max(reset_generation, target_generation)
+                    reset_generation = max(reset_generation, acknowledged_generation)
                     due_ts = (
-                        completed + self.cache_reset_debounce_ms
+                        completed_ts + self.cache_reset_debounce_ms
                         if generation > reset_generation
                         else 0
                     )
                     txn.execute(
                         "UPDATE retentionbot_cache_reset_users "
                         "SET reset_generation=?,due_ts=?,last_reset_ts=? WHERE user_id=?",
-                        (reset_generation, due_ts, completed, user_id),
+                        (reset_generation, due_ts, completed_ts, target_user_id),
                     )
 
                 await self.api.run_db_interaction(

@@ -2,7 +2,6 @@ import pytest
 
 from retentionbot.cache_reset import toggle_ignored_user_sentinel
 
-
 SENTINEL = "@__retention_cache_reset:test.local"
 
 

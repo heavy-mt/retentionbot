@@ -468,7 +468,7 @@ async def test_post_purge_invalidation_pulses_ignore_list_once_for_local_members
     homeserver,
 ):
     base, _ = homeserver
-    sentinel = "@__retention_cache_reset:test.local"
+    sentinel_prefix = "@__retention_cache_reset-"
     async with aiohttp.ClientSession() as session:
         alice, bob, _, _ = await people(base, session)
         room = await dm(alice, bob)
@@ -502,18 +502,24 @@ async def test_post_purge_invalidation_pulses_ignore_list_once_for_local_members
                 raise
             return data.get("ignored_users", {})
 
+        def reset_entries(ignored_users):
+            return {
+                user_id
+                for user_id in ignored_users
+                if user_id.startswith(sentinel_prefix)
+            }
+
         for _ in range(100):
             alice_ignored = await ignored(alice)
             bob_ignored = await ignored(bob)
-            alice_reset = {user_id for user_id in alice_ignored if user_id.startswith(sentinel_prefix)}
-            bob_reset = {user_id for user_id in bob_ignored if user_id.startswith(sentinel_prefix)}
+            alice_reset = reset_entries(alice_ignored)
+            bob_reset = reset_entries(bob_ignored)
             if alice_reset and bob_reset:
                 break
             await asyncio.sleep(0.05)
         else:
             pytest.fail("Element X cache-reset account-data pulse was not emitted")
 
-        assert "@already-blocked:test.local" in alice_ignored
         assert "@already-blocked:test.local" in alice_ignored
         assert len(alice_reset) == 1
         assert len(bob_reset) == 1
@@ -525,10 +531,8 @@ async def test_post_purge_invalidation_pulses_ignore_list_once_for_local_members
         first_alice_reset = alice_reset
         first_bob_reset = bob_reset
         await asyncio.sleep(0.5)
-        alice_after = await ignored(alice)
-        bob_after = await ignored(bob)
-        assert {user_id for user_id in alice_after if user_id.startswith(sentinel_prefix)} == first_alice_reset
-        assert {user_id for user_id in bob_after if user_id.startswith(sentinel_prefix)} == first_bob_reset
+        assert reset_entries(await ignored(alice)) == first_alice_reset
+        assert reset_entries(await ignored(bob)) == first_bob_reset
 
         # Retrying the same post-purge invalidation is idempotent and must not queue
         # another user reset generation.

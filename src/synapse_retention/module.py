@@ -533,6 +533,16 @@ class RetentionModule:
             )
             txn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS retentionbot_cache_reset_rooms(
+                    room_id TEXT PRIMARY KEY,
+                    generation BIGINT NOT NULL,
+                    expanded_generation BIGINT NOT NULL,
+                    due_ts BIGINT NOT NULL
+                )
+                """
+            )
+            txn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS retentionbot_cache_reset_users(
                     user_id TEXT PRIMARY KEY,
                     generation BIGINT NOT NULL,
@@ -546,20 +556,17 @@ class RetentionModule:
         await self.api.run_db_interaction("retention_invalidation_schema", create)
         self._invalidation_schema_ready = True
 
-    async def queue_cache_reset(self, event_id: str, room_id: str) -> int:
-        """Queue one debounced global EventCache reset for affected local users.
+    async def queue_cache_reset(self, event_id: str, room_id: str) -> bool:
+        """Queue one debounced Element X EventCache reset for this room.
 
-        matrix-rust-sdk currently has no per-room wire-level cache reset. Changing
-        m.ignored_user_list is a verified upstream code path that calls
-        EventCache.clear_all_rooms(), including persistent linked chunks. We toggle
-        one reserved, non-existent local MXID and preserve every real ignored user.
+        Event invalidations are frequent, so the request path only dirties one room
+        row. The background task expands due rooms to affected local users once per
+        debounce window, then performs at most one account-data pulse per user.
         """
         if not self.cache_reset_enabled:
-            return 0
+            return False
         await self.ensure_invalidation_schema()
-        now = self.now()
-        due = now + self.cache_reset_debounce_ms
-        sentinel = self.cache_reset_sentinel
+        due = self.now() + self.cache_reset_debounce_ms
 
         def queue(txn):
             txn.execute(
@@ -570,42 +577,35 @@ class RetentionModule:
             if previous:
                 if previous[0] != room_id:
                     raise ValueError("Cache-reset room mismatch")
-                return 0
+                return False
 
             txn.execute(
-                "SELECT user_id FROM local_current_membership WHERE room_id=?",
+                "SELECT generation,expanded_generation,due_ts "
+                "FROM retentionbot_cache_reset_rooms WHERE room_id=?",
                 (room_id,),
             )
-            users = sorted({row[0] for row in txn.fetchall() if row[0] != sentinel})
-            for user_id in users:
+            row = txn.fetchone()
+            if row:
+                generation = row[0] + 1
+                pending = row[0] > row[1]
+                due_ts = row[2] if pending and row[2] > 0 else due
                 txn.execute(
-                    "SELECT generation,reset_generation,due_ts "
-                    "FROM retentionbot_cache_reset_users WHERE user_id=?",
-                    (user_id,),
+                    "UPDATE retentionbot_cache_reset_rooms "
+                    "SET generation=?,due_ts=? WHERE room_id=?",
+                    (generation, due_ts, room_id),
                 )
-                row = txn.fetchone()
-                if row:
-                    generation = row[0] + 1
-                    pending = row[0] > row[1]
-                    due_ts = row[2] if pending and row[2] > 0 else due
-                    txn.execute(
-                        "UPDATE retentionbot_cache_reset_users "
-                        "SET generation=?,due_ts=? WHERE user_id=?",
-                        (generation, due_ts, user_id),
-                    )
-                else:
-                    txn.execute(
-                        "INSERT INTO retentionbot_cache_reset_users"
-                        "(user_id,generation,reset_generation,due_ts,last_reset_ts) "
-                        "VALUES(?,?,?,?,?)",
-                        (user_id, 1, 0, due, 0),
-                    )
+            else:
+                txn.execute(
+                    "INSERT INTO retentionbot_cache_reset_rooms"
+                    "(room_id,generation,expanded_generation,due_ts) VALUES(?,?,?,?)",
+                    (room_id, 1, 0, due),
+                )
 
             txn.execute(
                 "INSERT INTO retentionbot_cache_reset_events(event_id,room_id) VALUES(?,?)",
                 (event_id, room_id),
             )
-            return len(users)
+            return True
 
         return await self.api.run_db_interaction("retention_cache_reset_queue", queue)
 
@@ -614,16 +614,85 @@ class RetentionModule:
         updated = toggle_ignored_user_sentinel(content, self.cache_reset_sentinel)
         await self.api.account_data_manager.put_global(user_id, IGNORED_USER_LIST, updated)
 
+    async def _expand_due_cache_reset_rooms(self, now: int) -> int:
+        sentinel = self.cache_reset_sentinel
+
+        def expand(txn):
+            txn.execute(
+                "SELECT room_id,generation FROM retentionbot_cache_reset_rooms "
+                "WHERE generation>expanded_generation AND due_ts>0 AND due_ts<=? "
+                "ORDER BY due_ts LIMIT 100",
+                (now,),
+            )
+            rooms = txn.fetchall()
+            affected_users = 0
+            for room_id, target_generation in rooms:
+                txn.execute(
+                    "SELECT user_id FROM local_current_membership WHERE room_id=?",
+                    (room_id,),
+                )
+                users = sorted({row[0] for row in txn.fetchall() if row[0] != sentinel})
+                for user_id in users:
+                    txn.execute(
+                        "SELECT generation,reset_generation,due_ts "
+                        "FROM retentionbot_cache_reset_users WHERE user_id=?",
+                        (user_id,),
+                    )
+                    row = txn.fetchone()
+                    if row:
+                        generation = row[0] + 1
+                        pending = row[0] > row[1]
+                        due_ts = row[2] if pending and row[2] > 0 else now
+                        txn.execute(
+                            "UPDATE retentionbot_cache_reset_users "
+                            "SET generation=?,due_ts=? WHERE user_id=?",
+                            (generation, due_ts, user_id),
+                        )
+                    else:
+                        txn.execute(
+                            "INSERT INTO retentionbot_cache_reset_users"
+                            "(user_id,generation,reset_generation,due_ts,last_reset_ts) "
+                            "VALUES(?,?,?,?,?)",
+                            (user_id, 1, 0, now, 0),
+                        )
+                    affected_users += 1
+
+                txn.execute(
+                    "UPDATE retentionbot_cache_reset_rooms "
+                    "SET expanded_generation=?,due_ts=0 "
+                    "WHERE room_id=? AND generation=?",
+                    (target_generation, room_id, target_generation),
+                )
+
+            return affected_users
+
+        return await self.api.run_db_interaction(
+            "retention_cache_reset_expand_rooms", expand
+        )
+
     async def flush_cache_resets(self) -> None:
         if not self.cache_reset_enabled:
             return
         await self.ensure_invalidation_schema()
+
+        # A registered sentinel would turn the workaround into a real ignore rule.
+        # Fail closed and leave dirty generations queued until configuration is fixed.
+        if await self.api.get_userinfo_by_id(self.cache_reset_sentinel) is not None:
+            logger.error(
+                "Cache-reset sentinel зарегистрирован; workaround остановлен",
+                extra={
+                    "event": "client_cache.sentinel_registered",
+                    "user_id": self.cache_reset_sentinel,
+                },
+            )
+            return
 
         # Only Synapse's designated background-task process drains this shared queue.
         # Keep the distributed lock as a second guard for topology/config changes.
         async with self.hs.get_worker_locks_handler().acquire_lock(
             "retention_cache_reset_flush", "global"
         ):
+            await self._expand_due_cache_reset_rooms(self.now())
             now = self.now()
 
             def due_users(txn):
@@ -805,11 +874,11 @@ class RetentionModule:
                 rooms=[room_id],
             )
 
-        cache_reset_users = await self.queue_cache_reset(event_id, room_id)
+        cache_reset_queued = await self.queue_cache_reset(event_id, room_id)
         return 200, {
             "status": "done",
             "generation": generation,
-            "cache_reset_users": cache_reset_users,
+            "cache_reset_queued": cache_reset_queued,
         }
 
     @staticmethod

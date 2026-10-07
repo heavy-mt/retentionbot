@@ -16,12 +16,17 @@ from synapse.http.server import JsonResource
 from synapse.http.servlet import parse_integer, parse_string
 from synapse.types import StreamKeyType, UserID, create_requester
 
+from retentionbot.cache_reset import (
+    cache_reset_sentinel,
+    set_ignored_user_reset_sentinel,
+)
 from retentionbot.jsonlog import JsonFormatter
 from retentionbot.policy import ServerPolicy, duration
 
 from .commands import BotCommands
 
 PREFIX = "/_synapse/retention/v1"
+IGNORED_USER_LIST = "m.ignored_user_list"
 MESSAGE_TYPES = frozenset({"m.room.message", "m.room.encrypted", "m.reaction", "m.sticker"})
 logger = logging.getLogger(__name__)
 _ACTIVE_MODULE = None
@@ -118,12 +123,46 @@ class RetentionModule:
         bot_user = config.get("command_bot_user_id")
         if bot_user is not None:
             UserID.from_string(bot_user)
+
+        cache_reset = config.get("element_x_cache_reset", {})
+        if not isinstance(cache_reset, dict):
+            raise ValueError("element_x_cache_reset must be an object")
+        cache_reset_enabled = cache_reset.get("enabled", False)
+        if type(cache_reset_enabled) is not bool:
+            raise ValueError("element_x_cache_reset.enabled must be boolean")
+        cache_reset_sentinel = cache_reset.get("sentinel_user_id")
+        if cache_reset_enabled:
+            if not isinstance(cache_reset_sentinel, str):
+                raise ValueError(
+                    "element_x_cache_reset.sentinel_user_id is required when enabled"
+                )
+            parsed_sentinel = UserID.from_string(cache_reset_sentinel)
+            if parsed_sentinel.localpart != "__retention_cache_reset":
+                raise ValueError(
+                    "element_x_cache_reset.sentinel_user_id localpart must be "
+                    "__retention_cache_reset"
+                )
+        cache_reset_debounce_ms = duration(cache_reset.get("debounce", "10s"))
+        cache_reset_min_interval_ms = duration(cache_reset.get("min_interval", "5m"))
+        cache_reset_poll_ms = duration(cache_reset.get("poll_interval", "2s"))
+        if not 100 <= cache_reset_debounce_ms <= 300_000:
+            raise ValueError("element_x_cache_reset.debounce must be between 100ms and 5m")
+        if not 100 <= cache_reset_min_interval_ms <= 3_600_000:
+            raise ValueError("element_x_cache_reset.min_interval must be between 100ms and 1h")
+        if not 100 <= cache_reset_poll_ms <= 60_000:
+            raise ValueError("element_x_cache_reset.poll_interval must be between 100ms and 1m")
+
         return {
             "secret_file": config["secret_file"],
             "lead_ms": lead,
             "admin_level": admin,
             "cutoff_file": config.get("cutoff_file", "/data/retention-cutoff"),
             "bot_user": bot_user,
+            "cache_reset_enabled": cache_reset_enabled,
+            "cache_reset_sentinel": cache_reset_sentinel,
+            "cache_reset_debounce_ms": cache_reset_debounce_ms,
+            "cache_reset_min_interval_ms": cache_reset_min_interval_ms,
+            "cache_reset_poll_ms": cache_reset_poll_ms,
         }
 
     def __init__(self, config, api):
@@ -147,6 +186,13 @@ class RetentionModule:
         self.lead_ms, self.admin_level = config["lead_ms"], config["admin_level"]
         if config["bot_user"] and not self.hs.is_mine_id(config["bot_user"]):
             raise ValueError("Command bot must be a local Matrix user")
+        self.cache_reset_enabled = config["cache_reset_enabled"]
+        self.cache_reset_sentinel = config["cache_reset_sentinel"]
+        self.cache_reset_debounce_ms = config["cache_reset_debounce_ms"]
+        self.cache_reset_min_interval_ms = config["cache_reset_min_interval_ms"]
+        self.cache_reset_poll_ms = config["cache_reset_poll_ms"]
+        if self.cache_reset_enabled and not self.hs.is_mine_id(self.cache_reset_sentinel):
+            raise ValueError("Element X cache-reset sentinel must be a local Matrix user ID")
         self.commands = BotCommands(self, config["bot_user"])
         self._invalidation_schema_ready = False
         global _ACTIVE_MODULE
@@ -178,6 +224,13 @@ class RetentionModule:
                 method, [re.compile("^" + PREFIX + suffix + "$")], callback, "retention_server"
             )
         api.register_web_resource(PREFIX, resource)
+        if self.cache_reset_enabled:
+            api.looping_background_call(
+                self.flush_cache_resets,
+                self.cache_reset_poll_ms,
+                desc="retention_element_x_cache_reset",
+                run_on_all_instances=True,
+            )
 
     def now(self):
         return self.hs.get_clock().time_msec()
@@ -484,9 +537,255 @@ class RetentionModule:
                 )
                 """
             )
+            txn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS retentionbot_cache_reset_rooms(
+                    room_id TEXT PRIMARY KEY,
+                    generation BIGINT NOT NULL,
+                    expanded_generation BIGINT NOT NULL,
+                    due_ts BIGINT NOT NULL
+                )
+                """
+            )
+            txn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS retentionbot_cache_reset_users(
+                    user_id TEXT PRIMARY KEY,
+                    generation BIGINT NOT NULL,
+                    reset_generation BIGINT NOT NULL,
+                    due_ts BIGINT NOT NULL,
+                    last_reset_ts BIGINT NOT NULL
+                )
+                """
+            )
 
         await self.api.run_db_interaction("retention_invalidation_schema", create)
         self._invalidation_schema_ready = True
+
+    async def queue_cache_reset(self, room_id: str, generation: int) -> bool:
+        """Queue one debounced Element X EventCache reset for this room.
+
+        The room invalidation generation is the durable idempotency key. If Synapse
+        crashes after bumping the invalidation but before queuing the client reset, a
+        retry with the same generation still repairs the missing queue entry.
+        """
+        if not self.cache_reset_enabled:
+            return False
+        await self.ensure_invalidation_schema()
+        due = self.now() + self.cache_reset_debounce_ms
+
+        def queue_room(txn):
+            txn.execute(
+                "SELECT generation,expanded_generation,due_ts "
+                "FROM retentionbot_cache_reset_rooms WHERE room_id=?",
+                (room_id,),
+            )
+            row = txn.fetchone()
+            if row and generation <= row[0]:
+                return False
+            if row:
+                pending = row[0] > row[1]
+                due_ts = row[2] if pending and row[2] > 0 else due
+                txn.execute(
+                    "UPDATE retentionbot_cache_reset_rooms "
+                    "SET generation=?,due_ts=? WHERE room_id=?",
+                    (generation, due_ts, room_id),
+                )
+            else:
+                txn.execute(
+                    "INSERT INTO retentionbot_cache_reset_rooms"
+                    "(room_id,generation,expanded_generation,due_ts) VALUES(?,?,?,?)",
+                    (room_id, generation, 0, due),
+                )
+            return True
+
+        return await self.api.run_db_interaction(
+            "retention_cache_reset_queue_room", queue_room
+        )
+
+    async def _pulse_cache_reset(self, user_id: str, generation: int) -> None:
+        sentinel = cache_reset_sentinel(self.cache_reset_sentinel, generation)
+        for reserved_user_id in (self.cache_reset_sentinel, sentinel):
+            if await self.api.get_userinfo_by_id(reserved_user_id) is not None:
+                raise ValueError(
+                    f"Cache-reset sentinel is registered: {reserved_user_id}"
+                )
+
+        content = await self.api.account_data_manager.get_global(user_id, IGNORED_USER_LIST)
+        updated = set_ignored_user_reset_sentinel(
+            content,
+            self.cache_reset_sentinel,
+            generation,
+        )
+        await self.api.account_data_manager.put_global(user_id, IGNORED_USER_LIST, updated)
+
+    async def _expand_due_cache_reset_rooms(self, now: int) -> int:
+        sentinel = self.cache_reset_sentinel
+
+        def expand(txn):
+            txn.execute(
+                "SELECT room_id,generation FROM retentionbot_cache_reset_rooms "
+                "WHERE generation>expanded_generation AND due_ts>0 AND due_ts<=? "
+                "ORDER BY due_ts LIMIT 100",
+                (now,),
+            )
+            rooms = txn.fetchall()
+            affected_users = 0
+            for room_id, target_generation in rooms:
+                txn.execute(
+                    "SELECT user_id FROM local_current_membership WHERE room_id=?",
+                    (room_id,),
+                )
+                users = sorted({row[0] for row in txn.fetchall() if row[0] != sentinel})
+                for user_id in users:
+                    txn.execute(
+                        "SELECT generation,reset_generation,due_ts,last_reset_ts "
+                        "FROM retentionbot_cache_reset_users WHERE user_id=?",
+                        (user_id,),
+                    )
+                    row = txn.fetchone()
+                    if row:
+                        generation = row[0] + 1
+                        pending = row[0] > row[1]
+                        due_ts = (
+                            row[2]
+                            if pending and row[2] > 0
+                            else max(now, row[3] + self.cache_reset_min_interval_ms)
+                        )
+                        txn.execute(
+                            "UPDATE retentionbot_cache_reset_users "
+                            "SET generation=?,due_ts=? WHERE user_id=?",
+                            (generation, due_ts, user_id),
+                        )
+                    else:
+                        txn.execute(
+                            "INSERT INTO retentionbot_cache_reset_users"
+                            "(user_id,generation,reset_generation,due_ts,last_reset_ts) "
+                            "VALUES(?,?,?,?,?)",
+                            (user_id, 1, 0, now, 0),
+                        )
+                    affected_users += 1
+
+                txn.execute(
+                    "UPDATE retentionbot_cache_reset_rooms "
+                    "SET expanded_generation=?,due_ts=0 "
+                    "WHERE room_id=? AND generation=?",
+                    (target_generation, room_id, target_generation),
+                )
+
+            return affected_users
+
+        return await self.api.run_db_interaction(
+            "retention_cache_reset_expand_rooms", expand
+        )
+
+    async def flush_cache_resets(self) -> None:
+        if not self.cache_reset_enabled:
+            return
+        await self.ensure_invalidation_schema()
+
+        # Every module instance may run this loop so worker-only deployments are
+        # covered. Synapse's distributed lock serializes the actual shared drain.
+        async with self.hs.get_worker_locks_handler().acquire_lock(
+            "retention_cache_reset_flush", "global"
+        ):
+            await self._expand_due_cache_reset_rooms(self.now())
+            now = self.now()
+
+            def due_users(txn):
+                txn.execute(
+                    "SELECT user_id FROM retentionbot_cache_reset_users "
+                    "WHERE generation>reset_generation AND due_ts>0 AND due_ts<=? "
+                    "ORDER BY due_ts LIMIT 100",
+                    (now,),
+                )
+                return [row[0] for row in txn.fetchall()]
+
+            users = await self.api.run_db_interaction(
+                "retention_cache_reset_due_users", due_users
+            )
+            for user_id in users:
+                now = self.now()
+
+                def current(txn, target_user_id=user_id):
+                    txn.execute(
+                        "SELECT generation,reset_generation,due_ts "
+                        "FROM retentionbot_cache_reset_users WHERE user_id=?",
+                        (target_user_id,),
+                    )
+                    return txn.fetchone()
+
+                row = await self.api.run_db_interaction(
+                    "retention_cache_reset_current", current
+                )
+                if not row or row[0] <= row[1] or row[2] <= 0 or row[2] > now:
+                    continue
+                target_generation = row[0]
+                try:
+                    await self._pulse_cache_reset(user_id, target_generation)
+                except Exception:
+                    retry_at = self.now() + 60_000
+
+                    def postpone(
+                        txn,
+                        target_user_id=user_id,
+                        target_retry_at=retry_at,
+                    ):
+                        txn.execute(
+                            "UPDATE retentionbot_cache_reset_users SET due_ts=? "
+                            "WHERE user_id=? AND generation>reset_generation",
+                            (target_retry_at, target_user_id),
+                        )
+
+                    await self.api.run_db_interaction(
+                        "retention_cache_reset_postpone", postpone
+                    )
+                    logger.exception(
+                        "Не удалось сбросить клиентский EventCache",
+                        extra={"event": "client_cache.reset_failed", "user_id": user_id},
+                    )
+                    continue
+
+                completed = self.now()
+
+                def acknowledge(
+                    txn,
+                    target_user_id=user_id,
+                    acknowledged_generation=target_generation,
+                    completed_ts=completed,
+                ):
+                    txn.execute(
+                        "SELECT generation,reset_generation "
+                        "FROM retentionbot_cache_reset_users WHERE user_id=?",
+                        (target_user_id,),
+                    )
+                    latest = txn.fetchone()
+                    if not latest:
+                        return
+                    generation, reset_generation = latest
+                    reset_generation = max(reset_generation, acknowledged_generation)
+                    due_ts = (
+                        completed_ts + self.cache_reset_debounce_ms
+                        if generation > reset_generation
+                        else 0
+                    )
+                    txn.execute(
+                        "UPDATE retentionbot_cache_reset_users "
+                        "SET reset_generation=?,due_ts=?,last_reset_ts=? WHERE user_id=?",
+                        (reset_generation, due_ts, completed_ts, target_user_id),
+                    )
+
+                await self.api.run_db_interaction(
+                    "retention_cache_reset_acknowledge", acknowledge
+                )
+                logger.info(
+                    "Сброшен persistent EventCache Element X",
+                    extra={
+                        "event": "client_cache.reset",
+                        "user_id": user_id,
+                        "generation": target_generation,
+                    },
+                )
 
     async def invalidate_endpoint(self, request):
         self.authenticate(request)
@@ -564,15 +863,20 @@ class RetentionModule:
                 "Timeline комнаты помечен для повторной синхронизации",
                 extra={"event": "timeline.invalidated", "room_id": room_id, "event_id": event_id},
             )
-            # The retention generation is outside Synapse's normal Matrix streams, so
-            # wake any long-polling Sliding Sync request for members of this room. The
-            # patched handler will then force the unseen room into the response.
+            # The retention generation is outside Synapse's normal Matrix streams.
+            # Keep waking Sliding Sync for the legacy limited-timeline fallback.
             self.hs.get_notifier().on_new_event(
                 StreamKeyType.ROOM,
                 self.store.get_room_max_token(),
                 rooms=[room_id],
             )
-        return 200, {"status": "done", "generation": generation}
+
+        cache_reset_queued = await self.queue_cache_reset(room_id, generation)
+        return 200, {
+            "status": "done",
+            "generation": generation,
+            "cache_reset_queued": cache_reset_queued,
+        }
 
     @staticmethod
     def _requester_device_id(requester) -> str:
@@ -582,6 +886,8 @@ class RetentionModule:
         return f"token:{token_id}" if token_id is not None else "unknown"
 
     async def get_unseen_invalidation_rooms(self, requester, room_ids) -> set[str]:
+        if self.cache_reset_enabled:
+            return set()
         await self.ensure_invalidation_schema()
         relevant = set(room_ids)
         if not relevant:
@@ -610,6 +916,8 @@ class RetentionModule:
         return {room_id for room_id in unseen if room_id in relevant}
 
     async def should_force_limited(self, requester, room_id: str) -> bool:
+        if self.cache_reset_enabled:
+            return False
         await self.ensure_invalidation_schema()
         user_id = requester.user.to_string()
         device_id = self._requester_device_id(requester)

@@ -88,6 +88,13 @@ async def homeserver(tmp_path):
                     "cutoff_file": str(tmp_path / "retention-cutoff"),
                     "redaction_lead": 1500,
                     "command_bot_user_id": "@retention:test.local",
+                    "element_x_cache_reset": {
+                        "enabled": True,
+                        "sentinel_user_id": "@__retention_cache_reset:test.local",
+                        "debounce": 100,
+                        "min_interval": 100,
+                        "poll_interval": 100,
+                    },
                 },
             }
         ],
@@ -455,6 +462,83 @@ async def test_native_purge_stays_enabled_and_late_job_is_not_success(homeserver
             assert store.event(target)["status"] == "missed"
             assert store.event(target)["error"] == "EVENT_PURGED"
     store.close()
+
+
+async def test_post_purge_invalidation_pulses_ignore_list_once_for_local_members(
+    homeserver,
+):
+    base, _ = homeserver
+    sentinel_prefix = "@__retention_cache_reset-"
+    async with aiohttp.ClientSession() as session:
+        alice, bob, _, _ = await people(base, session)
+        room = await dm(alice, bob)
+        await alice.request(
+            "PUT",
+            f"/_matrix/client/v3/user/{segment(alice.user_id)}/account_data/m.ignored_user_list",
+            json={"ignored_users": {"@already-blocked:test.local": {}}},
+        )
+
+        api = ServerApi(base, SECRET, session)
+        event_id = "$cache-reset-" + uuid4().hex
+        result = await api.invalidate(event_id, room)
+        assert result["status"] == "done"
+        assert result["cache_reset_queued"] is True
+
+        second_event_id = "$cache-reset-" + uuid4().hex
+        second = await api.invalidate(second_event_id, room)
+        assert second["status"] == "done"
+        assert second["cache_reset_queued"] is True
+
+        async def ignored(client):
+            try:
+                data = await client.request(
+                    "GET",
+                    f"/_matrix/client/v3/user/{segment(client.user_id)}"
+                    "/account_data/m.ignored_user_list",
+                )
+            except ApiError as error:
+                if error.status == 404:
+                    return {}
+                raise
+            return data.get("ignored_users", {})
+
+        def reset_entries(ignored_users):
+            return {
+                user_id
+                for user_id in ignored_users
+                if user_id.startswith(sentinel_prefix)
+            }
+
+        for _ in range(100):
+            alice_ignored = await ignored(alice)
+            bob_ignored = await ignored(bob)
+            alice_reset = reset_entries(alice_ignored)
+            bob_reset = reset_entries(bob_ignored)
+            if alice_reset and bob_reset:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            pytest.fail("Element X cache-reset account-data pulse was not emitted")
+
+        assert "@already-blocked:test.local" in alice_ignored
+        assert len(alice_reset) == 1
+        assert len(bob_reset) == 1
+        assert set(alice_ignored) == {"@already-blocked:test.local"} | alice_reset
+        assert set(bob_ignored) == bob_reset
+
+        # Two different purged events in one room are aggregated into one account-data
+        # pulse. A second pulse would advance the reserved generation again.
+        first_alice_reset = alice_reset
+        first_bob_reset = bob_reset
+        await asyncio.sleep(0.5)
+        assert reset_entries(await ignored(alice)) == first_alice_reset
+        assert reset_entries(await ignored(bob)) == first_bob_reset
+
+        # Retrying the same post-purge invalidation is idempotent and must not queue
+        # another user reset generation.
+        repeated = await api.invalidate(event_id, room)
+        assert repeated["status"] == "done"
+        assert repeated["cache_reset_queued"] is False
 
 
 @pytest.mark.skipif(not os.getenv("RABBITMQ_TEST_URL"), reason="Set RABBITMQ_TEST_URL")

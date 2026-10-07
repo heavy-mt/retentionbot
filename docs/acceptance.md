@@ -97,15 +97,26 @@ Sliding Sync, совместимость с обновлениями Synapse п�
       `limited=true` для конкретного устройства, чтобы matrix-rust-sdk пересобрал
       timeline chunk без уже удалённого события.
 - [x] Stock Element X Android без force stop/relogin полностью убирает свежие
-      сообщения из timeline после post-purge invalidation; подтверждено для plain
-      DM и настоящего Megolm/E2EE DM.
+      сообщения из открытого timeline после post-purge invalidation; подтверждено
+      для plain DM и настоящего Megolm/E2EE DM.
+- [x] Проверен полный persistent EventCache reset через реальное изменение
+      `m.ignored_user_list`: при заблокированном экране и приложении в фоне Element X
+      удалил сообщения из четырёх тестовых комнат, включая ранее залипшие события и
+      плейсхолдеры redaction.
+- [x] Подтверждено, что `limited=true + prev_batch` не является полным reset
+      persistent EventCache для закрытых/background комнат; временный workaround
+      должен использовать account-data pulse до появления native retention purge
+      в matrix-rust-sdk.
 - [x] Настоящая E2EE-комната: 12 событий `m.room.encrypted`, все обработаны `done`, `attempts=0`; Element X расшифровывает сообщения и получает realtime redaction без перелогина.
 - [x] DM из двух участников: plain DM подтверждён через `/sync`/Sliding Sync,
       E2EE DM подтверждён как настоящий Direct Message через `m.direct`; для обоих
       типов свежие сообщения полностью исчезают из уже работающего Element X после
       redaction, штатного purge и post-purge invalidation.
 - [ ] Проверить текст, файл, изображение, голосовое сообщение, редакцию и реакцию.
-- [ ] Проверить открытый чат, закрытый чат, фон приложения и краткий офлайн.
+- [x] Проверить открытый чат.
+- [x] Проверить закрытый чат и фон приложения: legacy limited-reset не очищает
+      persistent cache; полный account-data reset очищает его даже при заблокированном экране.
+- [ ] Проверить краткий офлайн с автоматическим account-data workaround.
 - [ ] Проверить офлайн до момента после purge.
 - [ ] Проверить права администратора и обычного участника, а также room versions 10 и 12.
 - [ ] Проверить локального автора после выхода и fallback на локального модератора.

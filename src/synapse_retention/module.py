@@ -216,7 +216,6 @@ class RetentionModule:
                 self.flush_cache_resets,
                 self.cache_reset_poll_ms,
                 desc="retention_element_x_cache_reset",
-                run_on_all_instances=True,
             )
 
     def now(self):
@@ -620,9 +619,8 @@ class RetentionModule:
             return
         await self.ensure_invalidation_schema()
 
-        # The loop runs on every Synapse process so installations without a dedicated
-        # background-task worker are covered. A native distributed lock serializes the
-        # actual batch across processes.
+        # Only Synapse's designated background-task process drains this shared queue.
+        # Keep the distributed lock as a second guard for topology/config changes.
         async with self.hs.get_worker_locks_handler().acquire_lock(
             "retention_cache_reset_flush", "global"
         ):

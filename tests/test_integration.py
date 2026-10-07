@@ -92,6 +92,7 @@ async def homeserver(tmp_path):
                         "enabled": True,
                         "sentinel_user_id": "@__retention_cache_reset:test.local",
                         "debounce": 100,
+                        "min_interval": 100,
                         "poll_interval": 100,
                     },
                 },

@@ -17,6 +17,7 @@ modules:
         enabled: false
         sentinel_user_id: "@__retention_cache_reset:example.org"
         debounce: 10s
+        min_interval: 5m
         poll_interval: 2s
 
       # Optional: dedicated normal user; joins only personal management chats.

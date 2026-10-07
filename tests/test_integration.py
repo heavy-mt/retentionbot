@@ -481,7 +481,7 @@ async def test_post_purge_invalidation_pulses_ignore_list_once_for_local_members
         event_id = "$cache-reset-" + uuid4().hex
         result = await api.invalidate(event_id, room)
         assert result["status"] == "done"
-        assert result["cache_reset_users"] == 2
+        assert result["cache_reset_queued"] is True
 
         async def ignored(client):
             try:
@@ -513,7 +513,7 @@ async def test_post_purge_invalidation_pulses_ignore_list_once_for_local_members
         # another user reset generation.
         repeated = await api.invalidate(event_id, room)
         assert repeated["status"] == "done"
-        assert repeated["cache_reset_users"] == 0
+        assert repeated["cache_reset_queued"] is False
 
 
 @pytest.mark.skipif(not os.getenv("RABBITMQ_TEST_URL"), reason="Set RABBITMQ_TEST_URL")

@@ -229,6 +229,7 @@ class RetentionModule:
                 self.flush_cache_resets,
                 self.cache_reset_poll_ms,
                 desc="retention_element_x_cache_reset",
+                run_on_all_instances=True,
             )
 
     def now(self):
@@ -683,8 +684,8 @@ class RetentionModule:
             return
         await self.ensure_invalidation_schema()
 
-        # Only Synapse's designated background-task process drains this shared queue.
-        # Keep the distributed lock as a second guard for topology/config changes.
+        # Every module instance may run this loop so worker-only deployments are
+        # covered. Synapse's distributed lock serializes the actual shared drain.
         async with self.hs.get_worker_locks_handler().acquire_lock(
             "retention_cache_reset_flush", "global"
         ):

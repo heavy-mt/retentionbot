@@ -505,21 +505,30 @@ async def test_post_purge_invalidation_pulses_ignore_list_once_for_local_members
         for _ in range(100):
             alice_ignored = await ignored(alice)
             bob_ignored = await ignored(bob)
-            if sentinel in alice_ignored and sentinel in bob_ignored:
+            alice_reset = {user_id for user_id in alice_ignored if user_id.startswith(sentinel_prefix)}
+            bob_reset = {user_id for user_id in bob_ignored if user_id.startswith(sentinel_prefix)}
+            if alice_reset and bob_reset:
                 break
             await asyncio.sleep(0.05)
         else:
             pytest.fail("Element X cache-reset account-data pulse was not emitted")
 
         assert "@already-blocked:test.local" in alice_ignored
-        assert set(alice_ignored) == {"@already-blocked:test.local", sentinel}
-        assert set(bob_ignored) == {sentinel}
+        assert "@already-blocked:test.local" in alice_ignored
+        assert len(alice_reset) == 1
+        assert len(bob_reset) == 1
+        assert set(alice_ignored) == {"@already-blocked:test.local"} | alice_reset
+        assert set(bob_ignored) == bob_reset
 
         # Two different purged events in one room are aggregated into one account-data
-        # pulse. A second pulse would toggle the sentinel back out of the list.
+        # pulse. A second pulse would advance the reserved generation again.
+        first_alice_reset = alice_reset
+        first_bob_reset = bob_reset
         await asyncio.sleep(0.5)
-        assert sentinel in await ignored(alice)
-        assert sentinel in await ignored(bob)
+        alice_after = await ignored(alice)
+        bob_after = await ignored(bob)
+        assert {user_id for user_id in alice_after if user_id.startswith(sentinel_prefix)} == first_alice_reset
+        assert {user_id for user_id in bob_after if user_id.startswith(sentinel_prefix)} == first_bob_reset
 
         # Retrying the same post-purge invalidation is idempotent and must not queue
         # another user reset generation.

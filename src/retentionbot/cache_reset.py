@@ -11,8 +11,17 @@ def _plain_json(value):
     return value
 
 
-def toggle_ignored_user_sentinel(content, sentinel: str) -> dict:
-    """Toggle one reserved ignored-user sentinel without changing real entries."""
+def cache_reset_sentinel(base_sentinel: str, generation: int) -> str:
+    if generation <= 0 or not base_sentinel.startswith("@") or ":" not in base_sentinel:
+        raise ValueError("Invalid cache-reset sentinel")
+    localpart, server_name = base_sentinel[1:].split(":", 1)
+    if localpart != "__retention_cache_reset" or not server_name:
+        raise ValueError("Cache-reset sentinel localpart must be __retention_cache_reset")
+    return f"@{localpart}-{generation}:{server_name}"
+
+
+def set_ignored_user_reset_sentinel(content, base_sentinel: str, generation: int) -> dict:
+    """Replace our reserved sentinel while preserving real ignored-user entries."""
     if content is None:
         result = {}
     elif isinstance(content, Mapping):
@@ -24,10 +33,21 @@ def toggle_ignored_user_sentinel(content, sentinel: str) -> dict:
     if not isinstance(ignored, Mapping):
         raise ValueError("m.ignored_user_list.ignored_users must be an object")
 
-    ignored = dict(ignored)
-    if sentinel in ignored:
-        ignored.pop(sentinel)
-    else:
-        ignored[sentinel] = {}
-    result["ignored_users"] = ignored
+    current = cache_reset_sentinel(base_sentinel, generation)
+    base_localpart, server_name = base_sentinel[1:].split(":", 1)
+    prefix = f"@{base_localpart}-"
+    suffix = f":{server_name}"
+
+    cleaned = {}
+    for user_id, value in ignored.items():
+        is_ours = False
+        if isinstance(user_id, str) and user_id.startswith(prefix) and user_id.endswith(suffix):
+            middle = user_id[len(prefix) : -len(suffix)]
+            is_ours = middle.isdigit()
+        if user_id == base_sentinel or is_ours:
+            continue
+        cleaned[user_id] = value
+
+    cleaned[current] = {}
+    result["ignored_users"] = cleaned
     return result

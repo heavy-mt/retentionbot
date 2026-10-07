@@ -7,6 +7,18 @@ modules:
       cutoff_file: /data/retention-cutoff
       redaction_lead: 5m
       room_admin_power_level: 100
+
+      # Temporary Element X / matrix-rust-sdk workaround.
+      # The sentinel must be a valid, local, deliberately unregistered MXID.
+      # Each post-purge batch toggles this one ignored-user entry. Current
+      # matrix-rust-sdk treats a real m.ignored_user_list change as a reason to
+      # clear the persistent EventCache for all rooms of that user.
+      element_x_cache_reset:
+        enabled: false
+        sentinel_user_id: "@__retention_cache_reset:example.org"
+        debounce: 10s
+        poll_interval: 2s
+
       # Optional: dedicated normal user; joins only personal management chats.
       # command_bot_user_id: "@retention:example.org"
 

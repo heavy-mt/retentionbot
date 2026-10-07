@@ -484,6 +484,11 @@ async def test_post_purge_invalidation_pulses_ignore_list_once_for_local_members
         assert result["status"] == "done"
         assert result["cache_reset_queued"] is True
 
+        second_event_id = "$cache-reset-" + uuid4().hex
+        second = await api.invalidate(second_event_id, room)
+        assert second["status"] == "done"
+        assert second["cache_reset_queued"] is True
+
         async def ignored(client):
             try:
                 data = await client.request(
@@ -509,6 +514,12 @@ async def test_post_purge_invalidation_pulses_ignore_list_once_for_local_members
         assert "@already-blocked:test.local" in alice_ignored
         assert set(alice_ignored) == {"@already-blocked:test.local", sentinel}
         assert set(bob_ignored) == {sentinel}
+
+        # Two different purged events in one room are aggregated into one account-data
+        # pulse. A second pulse would toggle the sentinel back out of the list.
+        await asyncio.sleep(0.5)
+        assert sentinel in await ignored(alice)
+        assert sentinel in await ignored(bob)
 
         # Retrying the same post-purge invalidation is idempotent and must not queue
         # another user reset generation.

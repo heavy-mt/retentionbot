@@ -487,6 +487,22 @@ async def test_native_purge_stays_enabled_and_late_job_is_not_success(homeserver
             await worker.handle(target)
             assert store.event(target)["status"] == "missed"
             assert store.event(target)["error"] == "EVENT_PURGED"
+
+        # A native purge that wins the race must still invalidate the client's
+        # persistent timeline. This is the customer-visible success condition:
+        # a missed redaction cannot leave a stale cached message indefinitely.
+        invalidation = store.invalidation(target)
+        assert invalidation is not None
+        assert invalidation["status"] == "pending"
+        await worker.handle_invalidation(target)
+        completed = store.invalidation(target)
+        assert completed["status"] == "done", dict(completed)
+        assert isinstance(completed["generation"], int)
+
+        # Retrying a delivered job must not advance the room generation.
+        generation = completed["generation"]
+        await worker.handle_invalidation(target)
+        assert store.invalidation(target)["generation"] == generation
     store.close()
 
 

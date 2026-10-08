@@ -444,54 +444,56 @@ class RetentionModule:
             data["content"]["redacts"] = event_id
         else:
             data["redacts"] = event_id
-        # Same historical branch technique as Synapse's admin redaction, allowing local
-        # authors' messages to be removed even after they left the room.
-        kwargs = {"prev_event_ids": [event_id]} if local else {}
-        if local and supports_msc4242_state_dag(event):
-            kwargs["prev_state_events"] = event.prev_state_events
-        try:
-            (
-                redaction,
-                _,
-            ) = await self.hs.get_event_creation_handler().create_and_send_nonmember_event(
+        # Normal redactions must extend the current room DAG. Pinning every
+        # redaction to its target creates a separate forward extremity per
+        # message and causes quadratic extremity history growth.
+        handler = self.hs.get_event_creation_handler()
+
+        async def send_redaction(**kwargs):
+            return await handler.create_and_send_nonmember_event(
                 requester,
                 data,
                 ratelimit=False,
                 ignore_shadow_ban=True,
                 **kwargs,
             )
+
+        try:
+            redaction, _ = await send_redaction()
         except SynapseError as error:
-            # Never echo upstream exception text; it may include user-controlled content.
             if error.code != 403:
                 raise
-            # A room can require a high power level even for self-redaction.
-            # Try an existing local moderator against the current room state.
-            moderator = await self.local_moderator(event.room_id) if local else None
-            if moderator and moderator != sender:
-                sender = moderator
-                requester = create_requester(sender, authenticated_entity=self.api.server_name)
-                data["sender"] = sender
+            redaction = None
+
+            # Preserve support for departed local authors, but only fall back
+            # to the historical event branch when the current DAG is rejected.
+            if local:
+                historical_kwargs = {"prev_event_ids": [event_id]}
+                if supports_msc4242_state_dag(event):
+                    historical_kwargs["prev_state_events"] = event.prev_state_events
                 try:
-                    (
-                        redaction,
-                        _,
-                    ) = await self.hs.get_event_creation_handler().create_and_send_nonmember_event(
-                        requester, data, ratelimit=False, ignore_shadow_ban=True
-                    )
-                except SynapseError as fallback:
-                    if fallback.code != 403:
+                    redaction, _ = await send_redaction(**historical_kwargs)
+                except SynapseError as historical_error:
+                    if historical_error.code != 403:
                         raise
+
+            if redaction is None:
+                moderator = await self.local_moderator(event.room_id) if local else None
+                if moderator and moderator != sender:
+                    sender = moderator
+                    requester = create_requester(sender, authenticated_entity=self.api.server_name)
+                    data["sender"] = sender
+                    try:
+                        redaction, _ = await send_redaction()
+                    except SynapseError as fallback:
+                        if fallback.code != 403:
+                            raise
+                if redaction is None:
                     return 200, {
                         "status": "deferred",
                         "code": "REDACTION_FORBIDDEN",
                         "retry_at_ms": self.now() + 60_000,
                     }
-            else:
-                return 200, {
-                    "status": "deferred",
-                    "code": "REDACTION_FORBIDDEN",
-                    "retry_at_ms": self.now() + 60_000,
-                }
         visible = await self.store.get_event(redaction.event_id, allow_none=True)
         if visible is None or visible.type != "m.room.redaction":
             raise SynapseError(502, "Redaction недоступна клиентам.", "REDACTION_NOT_VISIBLE")

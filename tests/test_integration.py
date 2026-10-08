@@ -379,6 +379,32 @@ async def test_departed_local_author_and_state_protection(homeserver):
         assert (await api.redact("$unknown"))["status"] == "missed"
 
 
+async def test_bulk_local_redactions_do_not_fork_room_dag(homeserver):
+    # Regression: creating a separate historical branch for every redaction
+    # made event_forward_extremities grow linearly with redaction count and
+    # stream_ordering_to_exterm grow quadratically.
+    base, path = homeserver
+    async with aiohttp.ClientSession() as session:
+        alice, bob, _, _ = await people(base, session)
+        room = await dm(alice, bob)
+        await setting(alice, room)
+        targets = [await send(bob, room, f"bulk-target-{i}") for i in range(24)]
+        await asyncio.sleep(0.6)
+        api = ServerApi(base, SECRET, session)
+        for event_id in targets:
+            result = await api.redact(event_id)
+            assert result["status"] == "done", result
+
+        with sqlite3.connect(path / "synapse.db") as db:
+            extremities = db.execute(
+                "SELECT count(*) FROM event_forward_extremities WHERE room_id=?",
+                (room,),
+            ).fetchone()[0]
+        assert extremities <= 5, (
+            f"Ordinary redactions forked the room DAG: {extremities} extremities"
+        )
+
+
 async def test_server_rechecks_extended_policy_and_secret_scope(homeserver):
     base, _ = homeserver
     async with aiohttp.ClientSession() as session:

@@ -22,11 +22,11 @@ cleanup() {
 trap cleanup EXIT
 docker network create retention-smoke
 docker run --rm --workdir /data --entrypoint /usr/local/bin/python \
-    -v "$PWD/test-runtime/compose-synapse:/data" retention-synapse:1.161.0 \
+    -v "$PWD/test-runtime/compose-synapse:/data" retention-synapse:1.162.0 \
     -m synapse.app.homeserver --server-name test.invalid \
     --config-path /data/homeserver.yaml --generate-config --report-stats=no
 docker run --rm -i --entrypoint /usr/local/bin/python \
-    -v "$PWD/test-runtime/compose-synapse:/data" retention-synapse:1.161.0 - <<'PY'
+    -v "$PWD/test-runtime/compose-synapse:/data" retention-synapse:1.162.0 - <<'PY'
 from pathlib import Path
 import yaml
 path = Path('/data/homeserver.yaml')
@@ -50,7 +50,7 @@ sudo chown -R 991:991 test-runtime/compose-synapse
 docker run -d --name synapse-smoke --network retention-smoke \
     -e SYNAPSE_CONFIG_PATH=/data/homeserver.yaml \
     -v "$PWD/test-runtime/compose-synapse:/data" \
-    -v "$PWD/secrets/synapse_module_secret:/module-secret:ro" retention-synapse:1.161.0
+    -v "$PWD/secrets/synapse_module_secret:/module-secret:ro" retention-synapse:1.162.0
 docker exec -i synapse-smoke /usr/local/bin/python - <<'PY'
 import time
 import urllib.error
@@ -181,3 +181,4 @@ except socket.gaierror:
 else:
     raise AssertionError('Synapse can resolve isolated RabbitMQ')
 PY
+

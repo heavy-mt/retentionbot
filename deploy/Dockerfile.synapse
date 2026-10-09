@@ -1,14 +1,18 @@
-ARG SYNAPSE_VERSION=1.161.0
+ARG SYNAPSE_VERSION=1.162.0
 FROM ghcr.io/element-hq/synapse:v${SYNAPSE_VERSION}
 
 COPY pyproject.toml /tmp/retention-module/pyproject.toml
 COPY src /tmp/retention-module/src
 COPY deploy/patch-synapse-sliding-sync.py /tmp/retention-module/patch-synapse-sliding-sync.py
+COPY deploy/patch-synapse-room-limiter.py /tmp/retention-module/patch-synapse-room-limiter.py
 # Module imports only Synapse/stdlib, policy and JSON formatter. Queue drivers belong
 # to the external service image. Keep all Synapse dependency versions from the base.
 RUN /usr/local/bin/python -m pip install --no-cache-dir --no-deps /tmp/retention-module \
     && /usr/local/bin/python /tmp/retention-module/patch-synapse-sliding-sync.py \
+    && /usr/local/bin/python /tmp/retention-module/patch-synapse-room-limiter.py \
     && /usr/local/bin/python -m py_compile \
        "$(/usr/local/bin/python -c 'import synapse.rest.client.sync; print(synapse.rest.client.sync.__file__)')" \
        "$(/usr/local/bin/python -c 'import synapse.handlers.sliding_sync; print(synapse.handlers.sliding_sync.__file__)')" \
+       "$(/usr/local/bin/python -c 'import synapse.handlers.message; print(synapse.handlers.message.__file__)')" \
     && rm -rf /tmp/retention-module
+

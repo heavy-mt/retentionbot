@@ -4,6 +4,7 @@ import os
 import aiohttp
 import pytest
 from nio import AsyncClient, AsyncClientConfig, ErrorResponse
+
 from retentionbot.api import PREFIX, ApiError, JsonApi, segment
 from retentionbot.command_bot import BotConfig, CommandBot, shortcut
 from retentionbot.room_reference import reference

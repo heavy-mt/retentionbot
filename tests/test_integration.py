@@ -36,7 +36,7 @@ SECRET = "disposable-module-secret-" + "x" * 40
 
 
 @pytest.fixture
-async def homeserver(tmp_path):
+async def homeserver(tmp_path, request):
     python = str(Path(os.environ["SYNAPSE_PYTHON"]).absolute())
     config = tmp_path / "homeserver.yaml"
     subprocess.run(
@@ -86,7 +86,7 @@ async def homeserver(tmp_path):
                 "config": {
                     "secret_file": str(tmp_path / "module-secret"),
                     "cutoff_file": str(tmp_path / "retention-cutoff"),
-                    "redaction_lead": 1500,
+                    "redaction_lead": getattr(request, "param", {}).get("redaction_lead", 1500),
                     "command_bot_user_id": "@retention:test.local",
                     "element_x_cache_reset": {
                         "enabled": True,
@@ -379,6 +379,7 @@ async def test_departed_local_author_and_state_protection(homeserver):
         assert (await api.redact("$unknown"))["status"] == "missed"
 
 
+@pytest.mark.parametrize("homeserver", [{"redaction_lead": 60000}], indirect=True)
 async def test_bulk_local_redactions_do_not_fork_room_dag(homeserver):
     # Regression: creating a separate historical branch for every redaction
     # made event_forward_extremities grow linearly with redaction count and
@@ -387,7 +388,9 @@ async def test_bulk_local_redactions_do_not_fork_room_dag(homeserver):
     async with aiohttp.ClientSession() as session:
         alice, bob, _, _ = await people(base, session)
         room = await dm(alice, bob)
-        await setting(alice, room)
+        # Make redaction eligible after min_lifetime while leaving enough time
+        # before native purge for all 24 sends and serialized redactions in CI.
+        await setting(alice, room, maximum=60000)
         targets = [await send(bob, room, f"bulk-target-{i}") for i in range(24)]
         await asyncio.sleep(0.6)
         api = ServerApi(base, SECRET, session)

@@ -4,7 +4,6 @@ import os
 import aiohttp
 import pytest
 from nio import AsyncClient, AsyncClientConfig, ErrorResponse
-
 from retentionbot.api import PREFIX, ApiError, JsonApi, segment
 from retentionbot.command_bot import BotConfig, CommandBot, shortcut
 from retentionbot.room_reference import reference
@@ -20,6 +19,10 @@ from .test_integration import homeserver as homeserver
         ("https://matrix.to/#/%23team:example.org", ("alias", "#team:example.org")),
         ("matrix:roomid/room:example.org", ("id", "!room:example.org")),
         ("matrix:r/team:example.org", ("alias", "#team:example.org")),
+        ("!" + "A" * 43, ("id", "!" + "A" * 43)),
+        ("https://matrix.to/#/!" + "A" * 43 + "?via=example.org", ("id", "!" + "A" * 43)),
+        ("matrix:roomid/" + "A" * 43, ("id", "!" + "A" * 43)),
+        ("!" + "aB0_-" * 8 + "abc", ("id", "!" + "aB0_-" * 8 + "abc")),
         ("Отдел продаж", ("name", "Отдел продаж")),
     ],
 )
@@ -28,7 +31,15 @@ def test_room_reference(value, expected):
 
 
 def test_user_links_and_arbitrary_urls_are_not_rooms():
-    for value in ("https://example.org/secret", "https://matrix.to/#/@alice:example.org", "!bad"):
+    for value in (
+        "https://example.org/secret",
+        "https://matrix.to/#/@alice:example.org",
+        "!bad",
+        "!" + "A" * 42,
+        "!" + "A" * 44,
+        "!" + "A" * 42 + "+",
+        "#" + "A" * 43,
+    ):
         with pytest.raises(ValueError):
             reference(value)
     assert shortcut("7 дней") == "7d"

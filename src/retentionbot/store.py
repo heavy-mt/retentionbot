@@ -229,9 +229,11 @@ class Store:
         with self.db:
             self.db.execute(
                 "DELETE FROM events WHERE event_id IN (SELECT e.event_id FROM events e "
-                "WHERE e.status='done' AND e.completed_at<? "
+                "WHERE e.status IN ('done','missed') AND e.completed_at<? "
                 "AND NOT EXISTS (SELECT 1 FROM invalidations i "
-                "WHERE i.event_id=e.event_id AND i.status='pending') "
-                "ORDER BY e.completed_at LIMIT ?)",
-                (before, limit),
+                "WHERE i.event_id=e.event_id AND (i.status<>'done' "
+                "OR i.completed_at IS NULL OR i.completed_at>=?)) "
+                "ORDER BY e.completed_at,e.event_id LIMIT ?)",
+                (before, before, limit),
             )
+

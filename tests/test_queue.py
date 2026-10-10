@@ -96,7 +96,7 @@ def test_invalidation_waits_for_physical_retention_deadline(store):
     assert not store.due_invalidations(500000)
 
 
-def test_archival_keeps_pending_and_missed_jobs(store):
+def test_archival_keeps_pending_invalidations_then_removes_done_and_missed(store):
     ingest(store, event("$done"), event("$missed"), event("$pending"))
     store.finish("$done", {"status": "done", "redaction_id": "$r"}, 1000)
     store.finish("$missed", {"status": "missed", "code": "EVENT_PURGED"}, 1000)
@@ -108,4 +108,44 @@ def test_archival_keeps_pending_and_missed_jobs(store):
     store.invalidation_finish("$done", {"generation": 1}, 2001)
     store.invalidation_finish("$missed", {"generation": 2}, 2001)
     store.compact(3000)
-    assert store.counts() == {"missed": 1, "pending": 1}
+    assert store.counts() == {"pending": 1}
+    assert store.invalidation("$done") is None
+    assert store.invalidation("$missed") is None
+
+
+def test_archival_waits_for_invalidation_completion_age(store):
+    ingest(store, event())
+    store.finish("$new", {"status": "missed", "code": "EVENT_PURGED"}, 1000)
+    store.invalidation_finish("$new", {"generation": 1}, 5000)
+    store.compact(5000)
+    assert store.event("$new") is not None
+    store.compact(5001)
+    assert store.event("$new") is None
+    assert store.invalidation("$new") is None
+
+
+def test_archival_keeps_invalidation_without_completion_timestamp(store):
+    ingest(store, event())
+    store.finish("$new", {"status": "done", "redaction_id": "$r"}, 1000)
+    with store.db:
+        store.db.execute("UPDATE invalidations SET status='done' WHERE event_id=?", ("$new",))
+    store.compact(2000)
+    assert store.event("$new") is not None
+
+
+def test_archival_limits_batch_and_supports_legacy_events(store):
+    ingest(store, event("$a"), event("$b"), event("$blocked"))
+    for key in ("$a", "$b"):
+        store.finish(key, {"status": "done", "redaction_id": "$r"}, 1000)
+    store.finish("$blocked", {"status": "blocked", "code": "TEST"}, 1000)
+    # Older deployments have completed events without invalidation records.
+    with store.db:
+        store.db.execute("DELETE FROM invalidations")
+    store.compact(1000, limit=1)
+    assert store.counts() == {"done": 2, "blocked": 1}
+    store.compact(1001, limit=1)
+    assert store.event("$a") is None
+    assert store.event("$b") is not None
+    store.compact(1001, limit=1)
+    assert store.counts() == {"blocked": 1}
+

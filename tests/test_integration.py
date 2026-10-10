@@ -513,6 +513,9 @@ async def test_native_purge_stays_enabled_and_late_job_is_not_success(homeserver
             store.db.execute("UPDATE invalidations SET completed_at=1 WHERE event_id=?", (target,))
         receipt = {"event_id": target, "room_id": room, "generation": generation, "completed_at": 1}
         assert (await api.compact_invalidations([receipt]))["status"] == "done"
+        # Batch requests exceed the ordinary 8 KiB command-body limit.
+        assert len(json.dumps({"receipts": [receipt] * 100})) > 8192
+        assert (await api.compact_invalidations([receipt] * 100))["status"] == "done"
         # Lost HTTP response / retry after remote deletion is safe.
         assert (await api.compact_invalidations([receipt]))["status"] == "done"
         await observer.schedule()

@@ -93,10 +93,10 @@ def cutoff(path: Path, now: int) -> int:
     return value
 
 
-def body(request):
+def body(request, max_bytes=8192):
     try:
-        raw = request.content.read(8193)
-        if len(raw) > 8192:
+        raw = request.content.read(max_bytes + 1)
+        if len(raw) > max_bytes:
             raise ValueError()
         result = json.loads(raw)
         if not isinstance(result, dict):
@@ -793,7 +793,9 @@ class RetentionModule:
 
     async def compact_invalidations_endpoint(self, request):
         self.authenticate(request)
-        receipts = body(request).get("receipts")
+        # A batch of 1000 bound-length identifiers can exceed ordinary command
+        # payloads. Keep the larger limit exclusive to this authenticated API.
+        receipts = body(request, max_bytes=3 * 1024 * 1024).get("receipts")
         try:
             validate_receipts(receipts, self.now())
         except ValueError as error:

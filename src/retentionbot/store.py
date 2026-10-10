@@ -172,7 +172,6 @@ class Store:
                         (event_id, event["room_id"]),
                     )
 
-
     def due_invalidations(self, at: int, limit: int = 1000):
         return self.db.execute(
             """
@@ -198,8 +197,7 @@ class Store:
     def invalidation_queued(self, event_id: str, at: int):
         with self.db:
             self.db.execute(
-                "UPDATE invalidations SET queued_at=? "
-                "WHERE event_id=? AND status='pending'",
+                "UPDATE invalidations SET queued_at=? WHERE event_id=? AND status='pending'",
                 (at, event_id),
             )
 
@@ -225,13 +223,37 @@ class Store:
             for row in self.db.execute("SELECT status,COUNT(*) AS n FROM events GROUP BY status")
         }
 
+    def compaction_candidates(self, before: int, limit: int = 1000):
+        return self.db.execute(
+            "SELECT e.event_id,e.room_id,i.generation,i.completed_at "
+            "FROM events e LEFT JOIN invalidations i ON i.event_id=e.event_id "
+            "WHERE e.status IN ('done','missed') AND e.completed_at<? "
+            "AND (i.event_id IS NULL OR (i.status='done' AND i.generation IS NOT NULL "
+            "AND i.completed_at<?)) ORDER BY e.completed_at,e.event_id LIMIT ?",
+            (before, before, min(limit, 1000)),
+        ).fetchall()
+
+    def compact_confirmed(self, candidates: list, before: int):
+        # Recheck eligibility after the remote acknowledgement. Never delete a
+        # newly eligible row that was absent from the acknowledged batch.
+        with self.db:
+            for item in candidates:
+                self.db.execute(
+                    "DELETE FROM events WHERE event_id=? AND status IN ('done','missed') "
+                    "AND completed_at<? AND NOT EXISTS (SELECT 1 FROM invalidations i "
+                    "WHERE i.event_id=events.event_id AND (i.status<>'done' "
+                    "OR i.completed_at IS NULL OR i.completed_at>=?))",
+                    (item["event_id"], before, before),
+                )
+
     def compact(self, before: int, limit: int = 1000):
         with self.db:
             self.db.execute(
                 "DELETE FROM events WHERE event_id IN (SELECT e.event_id FROM events e "
-                "WHERE e.status='done' AND e.completed_at<? "
+                "WHERE e.status IN ('done','missed') AND e.completed_at<? "
                 "AND NOT EXISTS (SELECT 1 FROM invalidations i "
-                "WHERE i.event_id=e.event_id AND i.status='pending') "
-                "ORDER BY e.completed_at LIMIT ?)",
-                (before, limit),
+                "WHERE i.event_id=e.event_id AND (i.status<>'done' "
+                "OR i.completed_at IS NULL OR i.completed_at>=?)) "
+                "ORDER BY e.completed_at,e.event_id LIMIT ?)",
+                (before, before, limit),
             )

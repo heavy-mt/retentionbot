@@ -20,6 +20,7 @@ from retentionbot.cache_reset import (
     cache_reset_sentinel,
     set_ignored_user_reset_sentinel,
 )
+from retentionbot.invalidation_cleanup import compact_receipts_txn, validate_receipts
 from retentionbot.jsonlog import JsonFormatter
 from retentionbot.policy import ServerPolicy, duration
 
@@ -210,6 +211,7 @@ class RetentionModule:
             ("GET", "/internal/policy", self.policy_endpoint),
             ("POST", "/internal/redact", self.redact_endpoint),
             ("POST", "/internal/invalidate", self.invalidate_endpoint),
+            ("POST", "/internal/compact-invalidations", self.compact_invalidations_endpoint),
             ("POST", "/command", self.command),
             ("POST", "/bot/invite", self.commands.invite),
             ("POST", "/bot/info", self.commands.info),
@@ -789,6 +791,22 @@ class RetentionModule:
                     },
                 )
 
+    async def compact_invalidations_endpoint(self, request):
+        self.authenticate(request)
+        receipts = body(request).get("receipts")
+        try:
+            validate_receipts(receipts, self.now())
+        except ValueError as error:
+            raise SynapseError(400, str(error), "BAD_COMPACTION") from error
+        await self.ensure_invalidation_schema()
+        confirmed = await self.api.run_db_interaction(
+            "retention_invalidation_compact",
+            compact_receipts_txn,
+            receipts,
+            self.cache_reset_enabled,
+        )
+        return 200, {"status": "done" if confirmed else "deferred"}
+
     async def invalidate_endpoint(self, request):
         self.authenticate(request)
         data = body(request)
@@ -1054,3 +1072,4 @@ class RetentionModule:
         if action == "help":
             result["actions"] = ["set", "status", "off", "help"]
         return 200, result
+

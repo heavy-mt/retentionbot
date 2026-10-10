@@ -1,10 +1,13 @@
 # Retentionbot — серверная версия
 
+Обновление и обслуживание 0.3.1: [инструкция](docs/operations.md).
+Очистка завершённых метаданных: [порядок и ограничения](docs/metadata-compaction.md).
+
 Служба автоудаления новых сообщений Matrix для Element X. Создаёт события
 `m.room.redaction` на стороне Synapse, которые клиенты получают через синхронизацию.
 Штатный retention Synapse продолжает очищать серверную историю.
 
-**Версия 0.3.0 удаляет сообщения без бота в обслуживаемых комнатах.**
+**Версия 0.3.1 удаляет сообщения без бота в обслуживаемых комнатах.**
 Поддерживаются обычные комнаты и Direct Messages, включая E2EE. Серверная служба
 использует ID, автора, тип и время события. Расшифрование сообщений ей не требуется.
 
@@ -236,7 +239,7 @@ access token. Сервер проверяет участие, актуальны
 
 ```bash
 docker run --rm --network matrix_net --user "$(id -u):$(id -g)" \
-  -v "$PWD/operator-token:/operator-token:ro" retentionbot:0.3.0 command \
+  -v "$PWD/operator-token:/operator-token:ro" retentionbot:0.3.1 command \
   --synapse-url http://matrix-synapse:8008 --token-file /operator-token \
   --json '{"command":"retention","action":"set","room_id":"!room:example.org","min_lifetime":"1h","max_lifetime":"7d"}'
 ```
@@ -338,3 +341,4 @@ SDK с E2EE устанавливается в dev-окружение и отде
 `RABBITMQ_TEST_URL` включает проверку реальной очереди. CI также собирает три
 образа и запускает Compose с настоящим Synapse и ограниченной ролью PostgreSQL.
 В Docker проверяется личная команда, меняющая retention без вступления бота в цель.
+

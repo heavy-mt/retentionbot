@@ -506,6 +506,35 @@ async def test_native_purge_stays_enabled_and_late_job_is_not_success(homeserver
         generation = completed["generation"]
         await worker.handle_invalidation(target)
         assert store.invalidation(target)["generation"] == generation
+        # Age terminal metadata without waiting seven real days. Synapse must
+        # acknowledge cleanup before observer removes the local completion.
+        with store.db:
+            store.db.execute("UPDATE events SET completed_at=1 WHERE event_id=?", (target,))
+            store.db.execute("UPDATE invalidations SET completed_at=1 WHERE event_id=?", (target,))
+        receipt = {"event_id": target, "room_id": room, "generation": generation, "completed_at": 1}
+        assert (await api.compact_invalidations([receipt]))["status"] == "done"
+        # Lost HTTP response / retry after remote deletion is safe.
+        assert (await api.compact_invalidations([receipt]))["status"] == "done"
+        await observer.schedule()
+        assert store.event(target) is None
+        await worker.handle_invalidation(target)
+        with sqlite3.connect(path / "synapse.db") as server_db:
+            assert (
+                server_db.execute(
+                    "SELECT 1 FROM retentionbot_event_invalidations WHERE event_id=?", (target,)
+                ).fetchone()
+                is None
+            )
+            assert (
+                server_db.execute(
+                    "SELECT generation FROM retentionbot_room_invalidations WHERE room_id=?",
+                    (room,),
+                ).fetchone()[0]
+                == generation
+            )
+        with pytest.raises(ApiError) as denied:
+            await ServerApi(base, "wrong-secret", session).compact_invalidations([receipt])
+        assert denied.value.status == 401
     store.close()
 
 
@@ -548,11 +577,7 @@ async def test_post_purge_invalidation_pulses_ignore_list_once_for_local_members
             return data.get("ignored_users", {})
 
         def reset_entries(ignored_users):
-            return {
-                user_id
-                for user_id in ignored_users
-                if user_id.startswith(sentinel_prefix)
-            }
+            return {user_id for user_id in ignored_users if user_id.startswith(sentinel_prefix)}
 
         for _ in range(100):
             alice_ignored = await ignored(alice)

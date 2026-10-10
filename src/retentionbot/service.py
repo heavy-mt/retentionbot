@@ -70,7 +70,14 @@ class Observer:
                 self.store.invalidation_queued(invalidation["event_id"], 0)
                 raise
 
-        self.store.compact(at - 7 * 86_400_000, self.config.batch_size)
+        before = at - 7 * 86_400_000
+        candidates = self.store.compaction_candidates(before, self.config.batch_size)
+        receipts = [dict(item) for item in candidates if item["generation"] is not None]
+        if receipts:
+            result = await self.api.compact_invalidations(receipts)
+            if result.get("status") != "done":
+                raise ApiError(503, "COMPACTION_UNCONFIRMED")
+        self.store.compact_confirmed(candidates, before)
 
 
 async def run(config: Config):

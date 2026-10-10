@@ -36,7 +36,7 @@ SECRET = "disposable-module-secret-" + "x" * 40
 
 
 @pytest.fixture
-async def homeserver(tmp_path):
+async def homeserver(tmp_path, request):
     python = str(Path(os.environ["SYNAPSE_PYTHON"]).absolute())
     config = tmp_path / "homeserver.yaml"
     subprocess.run(
@@ -86,7 +86,7 @@ async def homeserver(tmp_path):
                 "config": {
                     "secret_file": str(tmp_path / "module-secret"),
                     "cutoff_file": str(tmp_path / "retention-cutoff"),
-                    "redaction_lead": 1500,
+                    "redaction_lead": getattr(request, "param", {}).get("redaction_lead", 1500),
                     "command_bot_user_id": "@retention:test.local",
                     "element_x_cache_reset": {
                         "enabled": True,
@@ -379,6 +379,35 @@ async def test_departed_local_author_and_state_protection(homeserver):
         assert (await api.redact("$unknown"))["status"] == "missed"
 
 
+@pytest.mark.parametrize("homeserver", [{"redaction_lead": 60000}], indirect=True)
+async def test_bulk_local_redactions_do_not_fork_room_dag(homeserver):
+    # Regression: creating a separate historical branch for every redaction
+    # made event_forward_extremities grow linearly with redaction count and
+    # stream_ordering_to_exterm grow quadratically.
+    base, path = homeserver
+    async with aiohttp.ClientSession() as session:
+        alice, bob, _, _ = await people(base, session)
+        room = await dm(alice, bob)
+        # Make redaction eligible after min_lifetime while leaving enough time
+        # before native purge for all 24 sends and serialized redactions in CI.
+        await setting(alice, room, maximum=60000)
+        targets = [await send(bob, room, f"bulk-target-{i}") for i in range(24)]
+        await asyncio.sleep(0.6)
+        api = ServerApi(base, SECRET, session)
+        for event_id in targets:
+            result = await api.redact(event_id)
+            assert result["status"] == "done", result
+
+        with sqlite3.connect(path / "synapse.db") as db:
+            extremities = db.execute(
+                "SELECT count(*) FROM event_forward_extremities WHERE room_id=?",
+                (room,),
+            ).fetchone()[0]
+        assert extremities <= 5, (
+            f"Ordinary redactions forked the room DAG: {extremities} extremities"
+        )
+
+
 async def test_server_rechecks_extended_policy_and_secret_scope(homeserver):
     base, _ = homeserver
     async with aiohttp.ClientSession() as session:
@@ -461,6 +490,54 @@ async def test_native_purge_stays_enabled_and_late_job_is_not_success(homeserver
             await worker.handle(target)
             assert store.event(target)["status"] == "missed"
             assert store.event(target)["error"] == "EVENT_PURGED"
+
+        # A native purge that wins the race must still invalidate the client's
+        # persistent timeline. This is the customer-visible success condition:
+        # a missed redaction cannot leave a stale cached message indefinitely.
+        invalidation = store.invalidation(target)
+        assert invalidation is not None
+        assert invalidation["status"] == "pending"
+        await worker.handle_invalidation(target)
+        completed = store.invalidation(target)
+        assert completed["status"] == "done", dict(completed)
+        assert isinstance(completed["generation"], int)
+
+        # Retrying a delivered job must not advance the room generation.
+        generation = completed["generation"]
+        await worker.handle_invalidation(target)
+        assert store.invalidation(target)["generation"] == generation
+        # Age terminal metadata without waiting seven real days. Synapse must
+        # acknowledge cleanup before observer removes the local completion.
+        with store.db:
+            store.db.execute("UPDATE events SET completed_at=1 WHERE event_id=?", (target,))
+            store.db.execute("UPDATE invalidations SET completed_at=1 WHERE event_id=?", (target,))
+        receipt = {"event_id": target, "room_id": room, "generation": generation, "completed_at": 1}
+        assert (await api.compact_invalidations([receipt]))["status"] == "done"
+        # Batch requests exceed the ordinary 8 KiB command-body limit.
+        assert len(json.dumps({"receipts": [receipt] * 100})) > 8192
+        assert (await api.compact_invalidations([receipt] * 100))["status"] == "done"
+        # Lost HTTP response / retry after remote deletion is safe.
+        assert (await api.compact_invalidations([receipt]))["status"] == "done"
+        await observer.schedule()
+        assert store.event(target) is None
+        await worker.handle_invalidation(target)
+        with sqlite3.connect(path / "synapse.db") as server_db:
+            assert (
+                server_db.execute(
+                    "SELECT 1 FROM retentionbot_event_invalidations WHERE event_id=?", (target,)
+                ).fetchone()
+                is None
+            )
+            assert (
+                server_db.execute(
+                    "SELECT generation FROM retentionbot_room_invalidations WHERE room_id=?",
+                    (room,),
+                ).fetchone()[0]
+                == generation
+            )
+        with pytest.raises(ApiError) as denied:
+            await ServerApi(base, "wrong-secret", session).compact_invalidations([receipt])
+        assert denied.value.status == 401
     store.close()
 
 
@@ -503,11 +580,7 @@ async def test_post_purge_invalidation_pulses_ignore_list_once_for_local_members
             return data.get("ignored_users", {})
 
         def reset_entries(ignored_users):
-            return {
-                user_id
-                for user_id in ignored_users
-                if user_id.startswith(sentinel_prefix)
-            }
+            return {user_id for user_id in ignored_users if user_id.startswith(sentinel_prefix)}
 
         for _ in range(100):
             alice_ignored = await ignored(alice)

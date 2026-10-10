@@ -33,16 +33,25 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install -e '.[dev]'
-      - run: python -m venv .synapse-env && .synapse-env/bin/pip install matrix-synapse==1.161.0 && .synapse-env/bin/pip install --no-deps -e .
-      - run: .synapse-env/bin/python -c 'from synapse_retention.module import synapse_release_tuple; assert synapse_release_tuple("1.161.0") == (1, 161, 0); assert synapse_release_tuple("1.162.0") > (1, 161, 0)'
-      - run: ruff check src tests
+      - run: python -m venv .synapse-env && .synapse-env/bin/pip install matrix-synapse==1.162.0 && .synapse-env/bin/pip install --no-deps -e .
+      - run: .synapse-env/bin/python deploy/patch-synapse-room-limiter.py
+      - run: ruff check src tests deploy/patch-synapse-room-limiter.py deploy/check-synapse-room-limiter.py
       - run: pytest -q
         env:
           SYNAPSE_PYTHON: .synapse-env/bin/python
           RABBITMQ_TEST_URL: amqp://test:disposable-test-password@localhost:5672/
           TEST_DATABASE_URL: postgresql://test:disposable-test-password@localhost:5432/retentiontest
-      - run: docker build -t retentionbot:0.3.0 .
-      - run: docker build -f deploy/Dockerfile.synapse -t retention-synapse:1.161.0 .
-      - run: docker build --build-arg SYNAPSE_VERSION=1.162.0 -f deploy/Dockerfile.synapse -t retention-synapse:1.162.0 .
-      - run: docker build -f deploy/Dockerfile.command-bot -t retention-command-bot:0.3.0 .
+      - run: docker build -t retentionbot:0.3.1 .
+      - run: docker build -f deploy/Dockerfile.synapse -t retention-synapse:1.162.0 .
+      - name: Verify room limiter in the actual Synapse 1.162.0 image
+        run: |
+          docker run --rm --network none --entrypoint python \
+            -e RETENTION_VERIFY_INSTALLED_SYNAPSE=1 \
+            -e RETENTION_ROOM_LIMITER_PATCH=/tmp/patch-synapse-room-limiter.py \
+            -v "$PWD/deploy/check-synapse-room-limiter.py:/tmp/check-synapse-room-limiter.py:ro" \
+            -v "$PWD/deploy/patch-synapse-room-limiter.py:/tmp/patch-synapse-room-limiter.py:ro" \
+            retention-synapse:1.162.0 /tmp/check-synapse-room-limiter.py -v
+      - run: docker build -f deploy/Dockerfile.command-bot -t retention-command-bot:0.3.1 .
       - run: bash .github/smoke-compose.sh
+
+

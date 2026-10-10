@@ -52,6 +52,11 @@ class JsonApi:
 
 
 class ServerApi(JsonApi):
+    async def compact_invalidations(self, receipts: list[dict]):
+        return await self.request(
+            "POST", PREFIX + "/internal/compact-invalidations", json={"receipts": receipts}
+        )
+
     async def feed(self, after: int | None, limit: int = 1000):
         params = {"limit": str(limit)}
         if after is not None:
@@ -70,3 +75,4 @@ class ServerApi(JsonApi):
             PREFIX + "/internal/invalidate",
             json={"event_id": event_id, "room_id": room_id},
         )
+

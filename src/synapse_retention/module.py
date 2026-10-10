@@ -20,6 +20,7 @@ from retentionbot.cache_reset import (
     cache_reset_sentinel,
     set_ignored_user_reset_sentinel,
 )
+from retentionbot.invalidation_cleanup import compact_receipts_txn, validate_receipts
 from retentionbot.jsonlog import JsonFormatter
 from retentionbot.policy import ServerPolicy, duration
 
@@ -92,10 +93,10 @@ def cutoff(path: Path, now: int) -> int:
     return value
 
 
-def body(request):
+def body(request, max_bytes=8192):
     try:
-        raw = request.content.read(8193)
-        if len(raw) > 8192:
+        raw = request.content.read(max_bytes + 1)
+        if len(raw) > max_bytes:
             raise ValueError()
         result = json.loads(raw)
         if not isinstance(result, dict):
@@ -210,6 +211,7 @@ class RetentionModule:
             ("GET", "/internal/policy", self.policy_endpoint),
             ("POST", "/internal/redact", self.redact_endpoint),
             ("POST", "/internal/invalidate", self.invalidate_endpoint),
+            ("POST", "/internal/compact-invalidations", self.compact_invalidations_endpoint),
             ("POST", "/command", self.command),
             ("POST", "/bot/invite", self.commands.invite),
             ("POST", "/bot/info", self.commands.info),
@@ -444,54 +446,56 @@ class RetentionModule:
             data["content"]["redacts"] = event_id
         else:
             data["redacts"] = event_id
-        # Same historical branch technique as Synapse's admin redaction, allowing local
-        # authors' messages to be removed even after they left the room.
-        kwargs = {"prev_event_ids": [event_id]} if local else {}
-        if local and supports_msc4242_state_dag(event):
-            kwargs["prev_state_events"] = event.prev_state_events
-        try:
-            (
-                redaction,
-                _,
-            ) = await self.hs.get_event_creation_handler().create_and_send_nonmember_event(
+        # Normal redactions must extend the current room DAG. Pinning every
+        # redaction to its target creates a separate forward extremity per
+        # message and causes quadratic extremity history growth.
+        handler = self.hs.get_event_creation_handler()
+
+        async def send_redaction(**kwargs):
+            return await handler.create_and_send_nonmember_event(
                 requester,
                 data,
                 ratelimit=False,
                 ignore_shadow_ban=True,
                 **kwargs,
             )
+
+        try:
+            redaction, _ = await send_redaction()
         except SynapseError as error:
-            # Never echo upstream exception text; it may include user-controlled content.
             if error.code != 403:
                 raise
-            # A room can require a high power level even for self-redaction.
-            # Try an existing local moderator against the current room state.
-            moderator = await self.local_moderator(event.room_id) if local else None
-            if moderator and moderator != sender:
-                sender = moderator
-                requester = create_requester(sender, authenticated_entity=self.api.server_name)
-                data["sender"] = sender
+            redaction = None
+
+            # Preserve support for departed local authors, but only fall back
+            # to the historical event branch when the current DAG is rejected.
+            if local:
+                historical_kwargs = {"prev_event_ids": [event_id]}
+                if supports_msc4242_state_dag(event):
+                    historical_kwargs["prev_state_events"] = event.prev_state_events
                 try:
-                    (
-                        redaction,
-                        _,
-                    ) = await self.hs.get_event_creation_handler().create_and_send_nonmember_event(
-                        requester, data, ratelimit=False, ignore_shadow_ban=True
-                    )
-                except SynapseError as fallback:
-                    if fallback.code != 403:
+                    redaction, _ = await send_redaction(**historical_kwargs)
+                except SynapseError as historical_error:
+                    if historical_error.code != 403:
                         raise
+
+            if redaction is None:
+                moderator = await self.local_moderator(event.room_id) if local else None
+                if moderator and moderator != sender:
+                    sender = moderator
+                    requester = create_requester(sender, authenticated_entity=self.api.server_name)
+                    data["sender"] = sender
+                    try:
+                        redaction, _ = await send_redaction()
+                    except SynapseError as fallback:
+                        if fallback.code != 403:
+                            raise
+                if redaction is None:
                     return 200, {
                         "status": "deferred",
                         "code": "REDACTION_FORBIDDEN",
                         "retry_at_ms": self.now() + 60_000,
                     }
-            else:
-                return 200, {
-                    "status": "deferred",
-                    "code": "REDACTION_FORBIDDEN",
-                    "retry_at_ms": self.now() + 60_000,
-                }
         visible = await self.store.get_event(redaction.event_id, allow_none=True)
         if visible is None or visible.type != "m.room.redaction":
             raise SynapseError(502, "Redaction недоступна клиентам.", "REDACTION_NOT_VISIBLE")
@@ -787,6 +791,24 @@ class RetentionModule:
                     },
                 )
 
+    async def compact_invalidations_endpoint(self, request):
+        self.authenticate(request)
+        # A batch of 1000 bound-length identifiers can exceed ordinary command
+        # payloads. Keep the larger limit exclusive to this authenticated API.
+        receipts = body(request, max_bytes=3 * 1024 * 1024).get("receipts")
+        try:
+            validate_receipts(receipts, self.now())
+        except ValueError as error:
+            raise SynapseError(400, str(error), "BAD_COMPACTION") from error
+        await self.ensure_invalidation_schema()
+        confirmed = await self.api.run_db_interaction(
+            "retention_invalidation_compact",
+            compact_receipts_txn,
+            receipts,
+            self.cache_reset_enabled,
+        )
+        return 200, {"status": "done" if confirmed else "deferred"}
+
     async def invalidate_endpoint(self, request):
         self.authenticate(request)
         data = body(request)
@@ -1052,3 +1074,4 @@ class RetentionModule:
         if action == "help":
             result["actions"] = ["set", "status", "off", "help"]
         return 200, result
+

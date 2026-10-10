@@ -1,5 +1,6 @@
 """Room identifiers and share links; never fetch a URL supplied in a command."""
 
+import re
 from urllib.parse import unquote, urlsplit
 
 
@@ -19,7 +20,12 @@ def reference(value: str) -> tuple[str, str]:
             raise ValueError("Эта Matrix-ссылка не указывает на комнату.")
         value = ("#" if parts[0] == "r" else "!") + unquote(parts[1])
     if value.startswith(("!", "#")):
-        if ":" not in value or any(c.isspace() for c in value) or len(value) > 1024:
+        domainless_id = value.startswith("!") and re.fullmatch(r"[A-Za-z0-9_-]{43}", value[1:])
+        if (
+            (":" not in value and not domainless_id)
+            or any(c.isspace() for c in value)
+            or len(value) > 1024
+        ):
             raise ValueError("Некорректный ID или адрес комнаты.")
         return ("id" if value.startswith("!") else "alias"), value
     if value.startswith("@"):

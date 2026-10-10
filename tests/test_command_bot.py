@@ -20,6 +20,10 @@ from .test_integration import homeserver as homeserver
         ("https://matrix.to/#/%23team:example.org", ("alias", "#team:example.org")),
         ("matrix:roomid/room:example.org", ("id", "!room:example.org")),
         ("matrix:r/team:example.org", ("alias", "#team:example.org")),
+        ("!" + "A" * 43, ("id", "!" + "A" * 43)),
+        ("https://matrix.to/#/!" + "A" * 43 + "?via=example.org", ("id", "!" + "A" * 43)),
+        ("matrix:roomid/" + "A" * 43, ("id", "!" + "A" * 43)),
+        ("!" + "aB0_-" * 8 + "abc", ("id", "!" + "aB0_-" * 8 + "abc")),
         ("Отдел продаж", ("name", "Отдел продаж")),
     ],
 )
@@ -28,7 +32,15 @@ def test_room_reference(value, expected):
 
 
 def test_user_links_and_arbitrary_urls_are_not_rooms():
-    for value in ("https://example.org/secret", "https://matrix.to/#/@alice:example.org", "!bad"):
+    for value in (
+        "https://example.org/secret",
+        "https://matrix.to/#/@alice:example.org",
+        "!bad",
+        "!" + "A" * 42,
+        "!" + "A" * 44,
+        "!" + "A" * 42 + "+",
+        "#" + "A" * 43,
+    ):
         with pytest.raises(ValueError):
             reference(value)
     assert shortcut("7 дней") == "7d"
@@ -274,7 +286,7 @@ async def test_encrypted_personal_commands_and_restart_preserve_selection(homese
             assert answer(bot, sent.event_id)["ok"]
             received = await client.sync(timeout=0)
             assert any(
-                json.loads(e.body).get("max_lifetime") == "3d"
+                "Срок хранения: 3 дня" in e.body
                 for e in received.rooms.join[personal].timeline.events
                 if e.sender == bot_user["user_id"] and hasattr(e, "body")
             )
@@ -349,3 +361,4 @@ async def test_crash_after_apply_and_limited_sync_recover_commands(homeserver, m
             assert all(bot.store.saved(key)["sent"] for key in missed)
         finally:
             await bot.close()
+

@@ -17,19 +17,24 @@ import aiohttp
 from nio import AsyncClient, AsyncClientConfig, ErrorResponse, MegolmEvent, RoomMessageText
 
 from .api import PREFIX, ApiError, JsonApi
+from .bot_messages import reply_content
 from .config import base_url, secret
 from .policy import UNITS, duration
 from .store import now_ms
 
 logger = logging.getLogger(__name__)
 HELP = (
-    "Пришлите название комнаты или ссылку на неё. Чтобы получить ссылку в Element X: "
+    "Помогу настроить срок хранения сообщений.\n\n"
+    "1. Пришлите название комнаты или ссылку на неё.\n"
+    "2. Я покажу текущие настройки.\n"
+    "3. Пришлите новый срок, например «5 минут» или «1 час».\n\n"
+    "Чтобы получить ссылку в Element X: "
     "откройте нужную комнату, нажмите её название вверху и найдите «Поделиться» / "
     "«Скопировать ссылку». Названия пунктов зависят от версии приложения. "
-    "Если ссылки нет, пришлите название комнаты, а для личного чата — имя собеседника. "
-    "После выбора я покажу текущий срок и попрошу новый. "
-    "Настройку меняет администратор выбранной комнаты. «Статус» показывает срок; "
-    "«Другая комната» начинает новый выбор."
+    "Для личного чата можно прислать имя собеседника.\n\n"
+    "Настройку меняет администратор выбранной комнаты.\n"
+    "«Статус» — текущие настройки.\n"
+    "«Другая комната» — выбрать другую комнату."
 )
 
 
@@ -211,7 +216,7 @@ class CommandBot:
             await self.client.room_send(
                 saved["dm"],
                 "m.room.message",
-                {"msgtype": "m.notice", "body": saved["body"]},
+                reply_content(json.loads(saved["body"])),
                 tx_id="retention_" + hashlib.sha256(event_id.encode()).hexdigest(),
                 ignore_unverified_devices=True,
             )
@@ -244,10 +249,9 @@ class CommandBot:
         state.clear()
         state["selected"] = selected
         result["message"] = (
-            "Комната выбрана. Пришлите максимальный срок, например 7d или «7 дней». "
-            "Минимальный срок сохранится. Оба срока можно задать JSON-командой: "
-            '{"command":"retention","action":"set","min_lifetime":"1h","max_lifetime":"7d"}. '
-            "s — секунды, m — минуты, h — часы, d — дни, w — недели."
+            "Комната выбрана.\n"
+            "Пришлите новый срок хранения, например «5 минут» или «1 час». "
+            "Минимальный срок сохранится."
         )
         return result
 
@@ -316,7 +320,7 @@ class CommandBot:
             if not rooms:
                 raise ValueError(
                     "Комната не найдена среди тех, где вы администратор. Проверьте название "
-                    "или пришлите ссылку. " + HELP
+                    "или пришлите ссылку на комнату."
                 )
             if len(rooms) > 1 or resolved.get("truncated"):
                 state.clear()
@@ -478,3 +482,4 @@ async def run(config):
                 await asyncio.sleep(5)
     finally:
         await bot.close()
+

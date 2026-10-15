@@ -373,6 +373,7 @@ async def test_crash_after_apply_and_limited_sync_recover_commands(homeserver, m
 
 @requires_synapse
 @pytest.mark.integration
+@pytest.mark.parametrize("homeserver", [{"room_creation_burst": 100}], indirect=True)
 async def test_room_list_filters_permissions_spaces_and_bot_chats_and_paginates(homeserver):
     base, _ = homeserver
     async with aiohttp.ClientSession() as session:

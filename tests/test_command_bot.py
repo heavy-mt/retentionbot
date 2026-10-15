@@ -399,7 +399,10 @@ async def test_room_list_filters_permissions_spaces_and_bot_chats_and_paginates(
             "creation_content": {"type": "m.space"}, "name": "Пространство"}))['room_id']
         expected = {target}
         for _ in range(11):
-            expected.add(await dm(alice, bob))
+            room = await alice.request("POST", "/_matrix/client/v3/createRoom", json={
+                "room_version": "10", "preset": "private_chat", "name": "Тест страницы",
+            })
+            expected.add(room["room_id"])
         trigger = await send(alice, personal, "Перечислить комнаты")
         data = {"dm_room_id": personal, "event_id": trigger}
         first = await bot_api.request("POST", PREFIX + "/bot/rooms", json=data)

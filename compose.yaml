@@ -1,6 +1,6 @@
 x-service: &service
   build: .
-  image: retentionbot:0.3.1
+  image: retentionbot:0.3.2
   restart: unless-stopped
   read_only: true
   tmpfs: [/tmp]
@@ -29,7 +29,7 @@ services:
     build:
       context: .
       dockerfile: deploy/Dockerfile.command-bot
-    image: retention-command-bot:0.3.1
+    image: retention-command-bot:0.3.2
     command: [command-bot]
     restart: unless-stopped
     read_only: true

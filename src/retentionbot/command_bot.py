@@ -24,18 +24,39 @@ from .store import now_ms
 
 logger = logging.getLogger(__name__)
 HELP = (
-    "Помогу настроить срок хранения сообщений.\n\n"
-    "1. Пришлите название комнаты или ссылку на неё.\n"
-    "2. Я покажу текущие настройки.\n"
-    "3. Пришлите новый срок, например «5 минут» или «1 час».\n\n"
-    "Чтобы получить ссылку в Element X: "
-    "откройте нужную комнату, нажмите её название вверху и найдите «Поделиться» / "
-    "«Скопировать ссылку». Названия пунктов зависят от версии приложения. "
-    "Для личного чата можно прислать имя собеседника.\n\n"
-    "Настройку меняет администратор выбранной комнаты.\n"
-    "«Статус» — текущие настройки.\n"
-    "«Другая комната» — выбрать другую комнату."
+    "Помогу настроить автоматическое удаление сообщений в выбранной комнате.\n\n"
+    "На iPhone ссылку на комнату копировать не нужно:\n"
+    "1. Отправьте «Перечислить комнаты».\n"
+    "2. Найдите комнату по названию, участникам и описанию. Отправьте её номер.\n"
+    "3. Проверьте выбранную комнату в моём ответе.\n"
+    "4. Отправьте срок с единицей: «5 минут», «1 час» или «7 дней».\n"
+    "5. Дождитесь подтверждения и проверьте результат командой «Статус».\n\n"
+    "Показываю только комнаты, где вы участвуете и можете менять срок хранения. "
+    "Обычных прав модератора может быть недостаточно. В переписку добавлять меня не нужно: "
+    "команды отправляйте только сюда, в личный чат из двух участников.\n\n"
+    "Команды:\n«Перечислить комнаты» — получить свежий список.\n"
+    "«Далее» — следующая страница списка, если она есть.\n"
+    "«Статус» — сроки выбранной комнаты.\n"
+    "«Другая комната» — заново выбрать комнату.\n"
+    "«Выключить» — проверить возможность отключения; обязательный серверный срок остаётся.\n"
+    "«Помощь» — эта инструкция.\n\n"
+    "Также можно прислать точное название комнаты или имя собеседника. "
+    "Если названия совпадают, предложу список с номерами."
 )
+
+
+def room_choice(number, room):
+    details = []
+    if room.get("topic"):
+        details.append("Описание: " + room["topic"])
+    if room.get("participants"):
+        details.append("Собеседники: " + ", ".join(room["participants"]))
+    if room.get("participant_ids"):
+        details.append("Аккаунты: " + ", ".join(room["participant_ids"]))
+    if "member_count" in room:
+        details.append("Участников: " + str(room["member_count"]))
+    details.append("ID: " + room["room_id"])
+    return f"{number}. {room['name']}\n" + "\n".join(details)
 
 
 def human_duration(value):
@@ -235,31 +256,87 @@ class CommandBot:
                 **arguments,
             },
         )
+        message = result["message"]
+        if action == "set":
+            requested = arguments.get("max_lifetime")
+            if requested is not None and duration(requested) != result.get("max_lifetime"):
+                message += (
+                    " Запрошенный срок ограничен правилами сервера. Итоговый срок указан ниже."
+                )
+        message += (
+            "\nИзменения относятся только к этой комнате. "
+            "Для проверки отправьте «Статус», для другой комнаты — «Перечислить комнаты»."
+        )
         return {
             "ok": True,
-            "message": result["message"],
+            "message": message,
             "room": selected["name"],
             "room_id": selected["room_id"],
             "min_lifetime": human_duration(result.get("min_lifetime")),
             "max_lifetime": human_duration(result.get("max_lifetime")),
+            "allowed_min": human_duration(result.get("allowed_lifetime_min")),
+            "allowed_max": human_duration(result.get("allowed_lifetime_max")),
+            "redaction_lead": human_duration(result.get("redaction_lead_ms")),
+            "room_details": room_choice(1, selected).split("\n", 1)[1],
         }
 
     async def choose(self, dm, event, state, selected):
+        resolved = await self.server("resolve", dm, event, query=selected["room_id"])
+        selected = resolved["rooms"][0]
         result = await self.policy(dm, event, selected)
         state.clear()
         state["selected"] = selected
         result["message"] = (
-            "Комната выбрана.\n"
-            "Пришлите новый срок хранения, например «5 минут» или «1 час». "
-            "Минимальный срок сохранится."
+            "Комната выбрана. Проверьте название и участников ниже, особенно если есть "
+            "похожие чаты. Пока настройки не изменены.\n"
+            "Чтобы изменить срок, отправьте число с единицей: «5 минут», «1 час» или «7 дней». "
+            "Минимальный срок сохранится. После сохранения я покажу итоговый срок.\n"
+            "Выбрали не ту комнату? Отправьте «Перечислить комнаты»."
         )
         return result
+
+    async def list_rooms(self, dm, event, state, after=""):
+        result = await self.server("rooms", dm, event, after=after)
+        rooms = result["rooms"]
+        state.clear()
+        state["candidates"] = rooms
+        state["next"] = result.get("next")
+        if not rooms:
+            message = (
+                "На этой странице доступных комнат нет. Отправьте «Далее», чтобы продолжить поиск."
+                if state["next"] else
+                "Доступных комнат не найдено. Показываю только комнаты, в которые вы уже вступили "
+                "и где вам разрешено менять срок хранения. Проверьте, что используете нужный "
+                "аккаунт. Попросите администратора комнаты выдать необходимые права, затем "
+                "отправьте «Перечислить комнаты» ещё раз. Пространства и чаты с ботом не показываю."
+            )
+        else:
+            message = (
+                "Комнаты, где вы можете менять срок хранения. Найдите нужную по названию, "
+                "участникам и описанию. Отправьте только номер из ЭТОГО списка, например «2». "
+                "Номер выбирает комнату и пока не меняет срок."
+            )
+            if state["next"]:
+                message += (
+                    "\nЕсть ещё комнаты: отправьте «Далее». "
+                    "Нумерация на новой странице начнётся с 1."
+                )
+            message += "\nЕсли нужной комнаты нет, проверьте участие и права в ней."
+        return {"ok": True, "message": message,
+                "choices": [room_choice(i, room) for i, room in enumerate(rooms, 1)]}
 
     async def conversation(self, dm, event, state):
         text = event.body.strip()
         if not text or len(text.encode()) > 4096:
             raise ValueError("Пришлите короткую команду, название комнаты или ссылку.")
         folded = text.casefold()
+        if folded in {"перечислить комнаты", "список комнат", "комнаты", "/rooms"}:
+            return await self.list_rooms(dm, event, state)
+        if folded in {"далее", "ещё", "еще"}:
+            if not state.get("next"):
+                raise ValueError("Следующей страницы нет. Чтобы обновить список, "
+                                 "отправьте «Перечислить комнаты».")
+            return await self.list_rooms(dm, event, state, state["next"])
         if folded in {
             "help",
             "/help",
@@ -276,8 +353,7 @@ class CommandBot:
         }:
             return {"ok": True, "message": HELP}
         if folded in {"другая комната", "отмена", "назад"}:
-            state.clear()
-            return {"ok": True, "message": HELP}
+            return await self.list_rooms(dm, event, state)
         data = None
         if text.startswith("{"):
             try:
@@ -294,11 +370,21 @@ class CommandBot:
             if not 1 <= number <= len(candidates):
                 raise ValueError("Выберите номер из предложенного списка.")
             return await self.choose(dm, event, state, candidates[number - 1])
+        if text.isdecimal():
+            raise ValueError("Число без единицы выбирает номер комнаты из последнего списка. "
+                             "Сначала отправьте «Перечислить комнаты». Для срока укажите единицу: "
+                             "например «5 минут».")
         selected = state.get("selected")
         query = data.get("room", data.get("room_id")) if data else None
         if data and data.get("action") == "help":
             return {"ok": True, "message": HELP}
         value = shortcut(text) if data is None else None
+        if not selected and query is None and (
+            value or folded in {"status", "статус", "off", "выключить"}
+        ):
+            raise ValueError("Сначала выберите комнату: отправьте «Перечислить комнаты», "
+                             "затем её номер. После моего подтверждения отправьте срок с единицей "
+                             "или команду «Статус».")
         if query is None and (
             not selected
             or (
@@ -319,19 +405,23 @@ class CommandBot:
             rooms = resolved["rooms"]
             if not rooms:
                 raise ValueError(
-                    "Комната не найдена среди тех, где вы администратор. Проверьте название "
-                    "или пришлите ссылку на комнату."
+                    "Комната с таким названием не найдена среди доступных для настройки. "
+                    "Отправьте «Перечислить комнаты» и выберите номер. Если комнаты нет в списке, "
+                    "проверьте участие в ней и попросите администратора проверить ваши права."
                 )
             if len(rooms) > 1 or resolved.get("truncated"):
                 state.clear()
                 state["candidates"] = rooms
                 return {
                     "ok": True,
-                    "message": "Есть комнаты с одинаковым названием. Пришлите номер нужной."
+                    "message": "Есть комнаты с одинаковым названием. "
+                    "Сравните участников и описание, затем пришлите номер нужной. "
+                    "Ссылка с iPhone не требуется."
                     if not resolved.get("truncated")
-                    else "Совпадений много. Пришлите точную ссылку.",
+                    else "Совпадений много. Отправьте «Перечислить комнаты» и просмотрите "
+                    "страницы командой «Далее», затем выберите номер.",
                     "choices": [
-                        f"{i}. {room['name']} — {room['room_id']}"
+                        room_choice(i, room)
                         for i, room in enumerate(rooms, 1)
                     ],
                 }

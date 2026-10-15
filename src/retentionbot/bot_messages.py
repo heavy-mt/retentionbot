@@ -30,7 +30,23 @@ def reply_content(result):
     """Render both new results and unsent replies saved by older bot versions."""
     message = str(result.get("message") or "")
     if result.get("code") == "NOT_ROOM_ADMIN":
-        message = "Изменять срок хранения может только администратор выбранной комнаты."
+        message = (
+            "Изменять срок хранения может только администратор выбранной комнаты "
+            "с необходимыми правами. Права могли измениться после выбора комнаты. "
+            "Попросите администратора проверить их и отправьте «Перечислить комнаты» заново."
+        )
+    elif result.get("code") in {"NOT_JOINED", "M_FORBIDDEN", "NOT_RETENTION_ROOM"}:
+        message = (
+            "Сейчас вы не можете настроить эту комнату: проверьте, что вступили в неё "
+            "и имеете права менять срок. Пространства и чаты управления ботом не подходят. "
+            "Отправьте «Перечислить комнаты» и выберите доступную комнату."
+        )
+    elif message == "Серверный срок хранения действует для этой комнаты.":
+        message = (
+            "Отключить автоудаление полностью нельзя: на сервере действует обязательный срок. "
+            "Команда не изменила настройки. Отправьте «Статус», чтобы увидеть текущий срок, "
+            "или задайте другой разрешённый срок, например «7 дней»."
+        )
     elif message == "Нужен запас между min_lifetime и max_lifetime.":
         message = (
             "Максимальный срок должен быть больше минимального. "
@@ -51,6 +67,10 @@ def reply_content(result):
             url = "https://matrix.to/#/" + quote(str(result["room_id"]), safe="")
             heading += f' · <a href="{escape(url, quote=True)}">Открыть комнату</a>'
         html.append(f"<p>{heading}</p>")
+    if result.get("room_details"):
+        details = str(result["room_details"])
+        paragraphs.append(details)
+        html.append("<p>" + escape(details).replace("\n", "<br>") + "</p>")
     if message:
         paragraphs.append(message)
         html.append("<p>" + escape(message).replace("\n", "<br>") + "</p>")
@@ -66,9 +86,26 @@ def reply_content(result):
     if choices:
         paragraphs.append("\n".join(str(choice) for choice in choices))
         html.append("<ol>" + "".join(
-            "<li>" + escape(re.sub(r"^\d+\.\s*", "", str(choice))) + "</li>"
+            "<li>" + escape(re.sub(r"^\d+\.\s*", "", str(choice))).replace("\n", "<br>")
+            + "</li>"
             for choice in choices
         ) + "</ol>")
+    if "allowed_min" in result:
+        limits = (
+            "Минимальный разрешённый срок: " + display_duration(result["allowed_min"])
+            + ". Максимальный разрешённый срок: " + display_duration(result["allowed_max"]) + "."
+            if result["allowed_min"] != "не задан" and result["allowed_max"] != "не задан"
+            else "Допустимые сроки ограничиваются правилами сервера."
+        )
+        timing = (
+            "Удаление обычно начинается немного раньше срока; запас на этом сервере: "
+            + display_duration(result.get("redaction_lead", "не задан")) + ". "
+            "При нагрузке или отсутствии сети результат на iPhone может появиться позже. "
+            "Сначала может появиться «Сообщение удалено», затем запись исчезнет из истории. "
+            "Этот срок не гарантирует удаления скачанных файлов, скриншотов и копий сообщений."
+        )
+        paragraphs.extend([limits, timing])
+        html.extend(["<p>" + escape(limits) + "</p>", "<p>" + escape(timing) + "</p>"])
     body = "\n\n".join(paragraphs) or "Не удалось подготовить ответ. Отправьте команду ещё раз."
     return {
         "msgtype": "m.notice",

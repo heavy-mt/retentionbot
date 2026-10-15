@@ -218,6 +218,7 @@ class RetentionModule:
             ("POST", "/bot/context", self.commands.context),
             ("POST", "/bot/chat", self.commands.chat),
             ("POST", "/bot/resolve", self.commands.resolve),
+            ("POST", "/bot/rooms", self.commands.rooms),
             ("POST", "/bot/command", self.commands.command),
         ):
             import re
@@ -1004,7 +1005,10 @@ class RetentionModule:
                     level = float("inf")
                 elif not levels:
                     level = 100
-            if level < self.admin_level:
+            retention_level = power.get("events", {}).get(
+                "m.room.retention", power.get("state_default", 50)
+            )
+            if level < max(self.admin_level, retention_level):
                 raise SynapseError(403, "Настройку меняет администратор комнаты.", "NOT_ROOM_ADMIN")
         return state
 
@@ -1062,6 +1066,9 @@ class RetentionModule:
         result = await self.policy_data(room)
         result.update(
             ok=True,
+            allowed_lifetime_min=self.server_policy.allowed_min,
+            allowed_lifetime_max=self.server_policy.allowed_max,
+            redaction_lead_ms=self.lead_ms,
             message="Команда уже выполнена. Показана текущая политика."
             if replay
             else "Настройка сохранена."

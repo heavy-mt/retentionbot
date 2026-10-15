@@ -97,7 +97,7 @@ async def test_personal_bot_guides_selects_sets_and_rechecks_rights(homeserver):
             await bot.sync_once(wait_ms=0)
             key = await send(alice, personal, "ссылка")
             await bot.sync_once(wait_ms=0)
-            assert "нажмите её название" in answer(bot, key)["message"]
+            assert "Перечислить комнаты" in answer(bot, key)["message"]
             key = await send(alice, personal, "Отдел")
             await bot.sync_once(wait_ms=0)
             assert answer(bot, key)["room_id"] == target
@@ -264,13 +264,21 @@ async def test_encrypted_personal_commands_and_restart_preserve_selection(homese
             await client.sync(timeout=0)
             await client.keys_upload()
             await client.keys_query()
-            selected = await client.room_send(
+            listed = await client.room_send(
                 personal,
                 "m.room.message",
                 {
                     "msgtype": "m.text",
-                    "body": "https://matrix.to/#/" + target,
+                    "body": "Перечислить комнаты",
                 },
+                ignore_unverified_devices=True,
+            )
+            assert not isinstance(listed, ErrorResponse)
+            await bot.sync_once(wait_ms=0)
+            candidates = bot.store.state(personal, alice.user_id)["candidates"]
+            number = next(i for i, room in enumerate(candidates, 1) if room["room_id"] == target)
+            selected = await client.room_send(
+                personal, "m.room.message", {"msgtype": "m.text", "body": str(number)},
                 ignore_unverified_devices=True,
             )
             assert not isinstance(selected, ErrorResponse)
@@ -361,4 +369,62 @@ async def test_crash_after_apply_and_limited_sync_recover_commands(homeserver, m
             assert all(bot.store.saved(key)["sent"] for key in missed)
         finally:
             await bot.close()
+
+
+@requires_synapse
+@pytest.mark.integration
+async def test_room_list_filters_permissions_spaces_and_bot_chats_and_paginates(homeserver):
+    base, _ = homeserver
+    async with aiohttp.ClientSession() as session:
+        alice, bob, _, _ = await people(base, session)
+        _, bot_api = await bot_person(base, session)
+        personal = await dm(alice, bot_api)
+        target = await dm(alice, bob)
+        for key, content in [("m.room.name", {"name": "Отдел"}),
+                             ("m.room.topic", {"topic": "Продажи"})]:
+            await alice.request("PUT", f"/_matrix/client/v3/rooms/{segment(target)}/state/{key}",
+                                json=content)
+        other = await dm(bob, alice)
+        path = f"/_matrix/client/v3/rooms/{segment(other)}/state/m.room.power_levels"
+        levels = await bob.request("GET", path)
+        levels["users"][alice.user_id] = 50
+        await bob.request("PUT", path, json=levels)
+        restricted = await dm(bob, alice, room_version="12")
+        path = f"/_matrix/client/v3/rooms/{segment(restricted)}/state/m.room.power_levels"
+        levels = await bob.request("GET", path)
+        levels["users"][alice.user_id] = 100
+        levels["events"]["m.room.retention"] = 150
+        await bob.request("PUT", path, json=levels)
+        space = (await alice.request("POST", "/_matrix/client/v3/createRoom", json={
+            "creation_content": {"type": "m.space"}, "name": "Пространство"}))['room_id']
+        expected = {target}
+        for _ in range(11):
+            expected.add(await dm(alice, bob))
+        trigger = await send(alice, personal, "Перечислить комнаты")
+        data = {"dm_room_id": personal, "event_id": trigger}
+        first = await bot_api.request("POST", PREFIX + "/bot/rooms", json=data)
+        assert len(first["rooms"]) == 10 and first["next"]
+        second = await bot_api.request("POST", PREFIX + "/bot/rooms",
+                                       json={**data, "after": first["next"]})
+        rooms = first["rooms"] + second["rooms"]
+        assert {room["room_id"] for room in rooms} == expected
+        assert not second["next"]
+        chosen = next(room for room in rooms if room["room_id"] == target)
+        assert chosen["topic"] == "Продажи" and chosen["participant_ids"] == [bob.user_id]
+        assert {personal, other, restricted, space}.isdisjoint(expected)
+        with pytest.raises(ApiError) as error:
+            await alice.request("POST", PREFIX + "/bot/rooms", json=data)
+        assert error.value.code == "NOT_COMMAND_BOT"
+        outside = await send(alice, target, "Not a management command")
+        with pytest.raises(ApiError) as error:
+            await bot_api.request("POST", PREFIX + "/bot/rooms",
+                                  json={**data, "event_id": outside})
+        assert error.value.code == "BAD_COMMAND_EVENT"
+        path = f"/_matrix/client/v3/rooms/{segment(target)}/state/m.room.power_levels"
+        levels = await alice.request("GET", path)
+        levels["users"].update({alice.user_id: 50, bob.user_id: 100})
+        await alice.request("PUT", path, json=levels)
+        with pytest.raises(ApiError) as error:
+            await bot_api.request("POST", PREFIX + "/bot/resolve", json={**data, "query": target})
+        assert error.value.code == "NOT_ROOM_ADMIN"
 

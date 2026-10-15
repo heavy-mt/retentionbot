@@ -70,6 +70,20 @@ def test_permission_error_does_not_expose_internal_code():
     assert "NOT_ROOM_ADMIN" not in content["body"]
 
 
+def test_multiline_room_choices_remain_readable_and_escaped_in_html():
+    content = reply_content({"choices": ["1. Отдел\nОписание: <script>\nСобеседники: Анна"]})
+    assert "<br>Описание: &lt;script&gt;<br>Собеседники: Анна" in content["formatted_body"]
+    assert "<script>" not in content["formatted_body"]
+
+
+def test_server_limits_and_timing_are_explained_in_policy_reply():
+    content = reply_content({"max_lifetime": "5m", "allowed_min": "1m", "allowed_max": "365d",
+                             "redaction_lead": "5s"})
+    assert "Минимальный разрешённый срок: 1 минута" in content["body"]
+    assert "запас на этом сервере: 5 секунд" in content["body"]
+    assert "скачанных файлов" in content["body"]
+
+
 async def test_saved_outbox_is_rendered_when_sending_and_not_resent(tmp_path):
     bot = object.__new__(CommandBot)
     bot.store = BotStore(tmp_path / "bot")

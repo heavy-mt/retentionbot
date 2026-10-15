@@ -129,7 +129,7 @@ m.ignored_user_list с зарезервированным генерационн
 | POST /internal/redact, /internal/invalidate | Module secret | Работа внешнего worker |
 | POST /internal/compact-invalidations | Module secret | Receipts: event_id, room_id, generation, completed_at; 1..1000, старше семи суток |
 | POST /command | Matrix user token | Прямая операторская команда с проверкой прав |
-| POST /bot/info, /bot/invite, /bot/context, /bot/chat, /bot/resolve, /bot/command | Токен настроенного обычного бота | Управление через проверенное личное событие |
+| POST /bot/info, /bot/invite, /bot/context, /bot/chat, /bot/resolve, /bot/rooms, /bot/command | Токен настроенного обычного бота | Управление через проверенное личное событие |
 
 BotStore хранит структурированный ответ JSON для идемпотентности. Только перед
 отправкой reply_content создаёт m.notice с plain body и org.matrix.custom.html.
@@ -145,3 +145,18 @@ job отклоняется в dead queue; неожиданные ошибки д
 на одном RabbitMQ узле даёт persistence, не HA. Состояние работы — в БД, очередь
 не является единственным источником истины. При изменении recovery протокола
 проверять lost publish, lost HTTP response, restart, replay и согласование cutoff.
+
+## Список комнат (0.3.2)
+
+POST /bot/rooms использует токен только настроенного бота и проверенное событие
+личного чата. after - непрозрачный для клиента room ID последней просмотренной
+комнаты. Комнаты перебираются по ID; запрос сканирует не более 100 комнат и
+возвращает не более 10 доступных. next может быть задан даже при пустой странице.
+Клиент предлагает «Далее», номера относятся только к текущей странице.
+Список использует фактическое участие и максимум из room_admin_power_level и
+требования к событию m.room.retention. Пространства и чаты с ботом исключены.
+Описание содержит до 3 имён и MXID собеседников, число joined-участников и
+сокращённый topic. Имена/описания экранируются при формировании Matrix HTML.
+Список сохраняется в состоянии диалога; выбор и запись перепроверяют права.
+Нумерованный выбор работает и в E2EE. API команд дополнительно возвращает
+allowed_lifetime_min/max и redaction_lead_ms для точного объяснения ограничений.

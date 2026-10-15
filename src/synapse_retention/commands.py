@@ -87,8 +87,18 @@ class BotCommands:
     async def describe(self, room_id, actor):
         await self.module.authorized_state(actor, room_id, admin=True)
         state = await self.module.api.get_room_state(
-            room_id, [("m.room.name", ""), ("m.room.canonical_alias", ""), ("m.room.member", None)]
+            room_id, [("m.room.name", ""), ("m.room.canonical_alias", ""),
+                      ("m.room.topic", ""), ("m.room.create", ""), ("m.room.member", None)]
         )
+        create = state.get(("m.room.create", ""))
+        bot_member = state.get(("m.room.member", self.bot_user))
+        if (create and create.content.get("type") == "m.space") or (
+            bot_member and bot_member.content.get("membership") in {"join", "invite"}
+        ):
+            raise SynapseError(
+                403, "Выберите комнату переписки, а не чат с ботом или пространство.",
+                "NOT_RETENTION_ROOM",
+            )
         name_event = state.get(("m.room.name", ""))
         alias_event = state.get(("m.room.canonical_alias", ""))
         name = name_event.content.get("name") if name_event else None
@@ -105,7 +115,46 @@ class BotCommands:
             and event.content.get("membership") in {"join", "invite"}
         ]
         label = name or alias or ", ".join(sorted(participants)[:5]) or room_id
-        return {"room_id": room_id, "name": label[:200], "alias": alias}
+        topic = state.get(("m.room.topic", ""))
+        topic = topic.content.get("topic", "") if topic else ""
+        identities = sorted(
+            user for (kind, user), event in state.items()
+            if kind == "m.room.member" and user != actor
+            and event.content.get("membership") in {"join", "invite"}
+        )
+        return {"room_id": room_id, "name": label[:200], "alias": alias,
+                "participants": sorted(participants)[:3], "participant_ids": identities[:3],
+                "member_count": sum(1 for (kind, _), event in state.items()
+                                    if kind == "m.room.member"
+                                    and event.content.get("membership") == "join"),
+                "topic": topic[:100] if isinstance(topic, str) else ""}
+
+    async def rooms(self, request):
+        """List only joined rooms the live actor is allowed to configure."""
+        await self.authenticate(request)
+        from .module import body
+
+        data = body(request)
+        actor = await self.actor(data)
+        after = data.get("after", "")
+        if not isinstance(after, str) or len(after) > 1024:
+            raise SynapseError(400, "Запросите список комнат заново.", "BAD_ROOM_CURSOR")
+        matches = []
+        scanned = after
+        more = False
+        rooms = sorted(await self.module.store.get_rooms_for_user(actor))
+        eligible = [room for room in rooms if room > after and room != data["dm_room_id"]]
+        for index, room in enumerate(eligible):
+            scanned = room
+            try:
+                matches.append(await self.describe(room, actor))
+            except SynapseError as error:
+                if error.code not in {403, 404}:
+                    raise
+            if len(matches) == 10 or index == 99:
+                more = index + 1 < len(eligible)
+                break
+        return 200, {"rooms": matches, "next": scanned if more else None}
 
     async def resolve(self, request):
         await self.authenticate(request)

@@ -100,6 +100,10 @@ async def homeserver(tmp_path, request):
         ],
         redaction_retention_period=0,
         rc_message={"per_second": 1000, "burst_count": 10000},
+        rc_room_creation={
+            "per_second": 0.016,
+            "burst_count": getattr(request, "param", {}).get("room_creation_burst", 10),
+        },
         rc_registration={"per_second": 1000, "burst_count": 10000},
         rc_joins={
             "local": {"per_second": 1000, "burst_count": 10000},
